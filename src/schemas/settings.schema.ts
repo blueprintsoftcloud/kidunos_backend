@@ -8,14 +8,12 @@ export const updateWarehouseSettingsSchema = z.object({
 });
 
 export const updateShippingConfigSchema = z.object({
-  sameStatePerKmRate: z.coerce.number().min(0).optional(),
-  sameStateFreeKmThreshold: z.coerce.number().min(0).optional(),
-  noLocationFlatRate: z.coerce.number().min(0).optional(),
-  stateRates: z.union([z.string(), z.record(z.string(), z.coerce.number())]).optional(),
-  districtRates: z.union([z.string(), z.record(z.string(), z.record(z.string(), z.coerce.number()))]).optional(),
+  uaeFlatRate: z.coerce.number().finite().min(0).max(10000).optional(),
+  emirateRates: z.record(z.string().trim().min(1), z.coerce.number().finite().min(0).max(10000)).optional(),
   calculateShippingForCOD: z.boolean().optional(),
   calculateShippingForOnline: z.boolean().optional(),
-  calculateShippingForQR: z.boolean().optional(),
+}).refine((value) => value.uaeFlatRate !== undefined || value.emirateRates !== undefined || value.calculateShippingForCOD !== undefined || value.calculateShippingForOnline !== undefined, {
+  message: "At least one shipping setting must be provided",
 });
 export const updateTrackingPartnerSettingsSchema = z.object({
   enabled: z.boolean(),

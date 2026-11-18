@@ -5,6 +5,7 @@ import { adminOrStaff } from "../middleware/staffPermission.middleware";
 import { profileData, updateAvatar, deleteAvatar } from "../controllers/profileAdmin.controller";
 import {
   requestProfileUpdate,
+  resendProfileUpdateOtp,
   verifyAndUpdateProfile,
 } from "../controllers/updateProfile.controller";
 import {
@@ -16,7 +17,12 @@ import {
   deleteUser,
 } from "../controllers/admin.controller";
 import { validate } from "../middleware/validate.middleware";
-import { createUserSchema } from "../schemas/user.schema";
+import {
+  createUserSchema,
+  requestProfileUpdateSchema,
+  resendProfileUpdateSchema,
+  verifyProfileUpdateSchema,
+} from "../schemas/user.schema";
 import {
   getCompanySettings,
   updateCompanySettings,
@@ -61,12 +67,21 @@ router.post(
   "/adminProfile/request-update",
   authMiddleware,
   adminMiddleware,
+  validate(requestProfileUpdateSchema),
   requestProfileUpdate,
+);
+router.post(
+  "/adminProfile/resend-otp",
+  authMiddleware,
+  adminMiddleware,
+  validate(resendProfileUpdateSchema),
+  resendProfileUpdateOtp,
 );
 router.post(
   "/adminProfile/verify-update",
   authMiddleware,
   adminMiddleware,
+  validate(verifyProfileUpdateSchema),
   verifyAndUpdateProfile,
 );
 

@@ -3,6 +3,7 @@ import { AppSetting, DeliveryPartner } from "../models/mongoose";
 import logger from "../utils/logger";
 import { createAuditLog } from "../utils/auditLog";
 import { env } from "../config/env";
+import { UAE_EMIRATES } from "../utils/uae";
 
 export const resolvePartnerTrackingUrl = (partnerName: string): string => {
   const norm = partnerName.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -250,14 +251,10 @@ export const updateWarehouseSettings = async (req: Request, res: Response) => {
 // ── Shipping Configuration ────────────────────────────────────────────────────────────
 
 const SHIPPING_DEFAULTS: Record<string, string> = {
-  SHIPPING_SAME_STATE_PER_KM: "5",
-  SHIPPING_SAME_STATE_FREE_KM: "10",
-  SHIPPING_NO_LOCATION_FLAT: "50",
-  SHIPPING_STATE_RATES: JSON.stringify({ Kerala: 50 }),
-  SHIPPING_DISTRICT_RATES: JSON.stringify({}),
+  SHIPPING_UAE_FLAT_RATE_AED: "15",
+  SHIPPING_UAE_EMIRATE_RATES_AED: "",
   SHIPPING_CALCULATE_COD: "true",
   SHIPPING_CALCULATE_ONLINE: "true",
-  SHIPPING_CALCULATE_QR: "true",
 };
 
 // GET /api/settings/shipping-config  (admin / super-admin)
@@ -268,37 +265,19 @@ export const getShippingConfig = async (req: Request, res: Response) => {
     const map: Record<string, any> = {};
     for (const s of settings) map[s.key] = s.value;
 
-    let stateRates: Record<string, number> = { Kerala: 50 };
-    if (map["SHIPPING_STATE_RATES"]) {
-      try {
-        stateRates = typeof map["SHIPPING_STATE_RATES"] === "string"
-          ? JSON.parse(map["SHIPPING_STATE_RATES"])
-          : map["SHIPPING_STATE_RATES"];
-      } catch (e) {
-        logger.error("Failed to parse state rates map", e);
-      }
-    }
-
-    let districtRates: Record<string, Record<string, number>> = {};
-    if (map["SHIPPING_DISTRICT_RATES"]) {
-      try {
-        districtRates = typeof map["SHIPPING_DISTRICT_RATES"] === "string"
-          ? JSON.parse(map["SHIPPING_DISTRICT_RATES"])
-          : map["SHIPPING_DISTRICT_RATES"];
-      } catch (e) {
-        logger.error("Failed to parse district rates map", e);
-      }
-    }
+    const uaeFlatRate = Number(map["SHIPPING_UAE_FLAT_RATE_AED"] ?? 15);
+    const savedEmirateRates = map["SHIPPING_UAE_EMIRATE_RATES_AED"]
+      ? JSON.parse(map["SHIPPING_UAE_EMIRATE_RATES_AED"])
+      : {};
+    const emirateRates = Object.fromEntries(
+      UAE_EMIRATES.map((emirate) => [emirate, Number(savedEmirateRates[emirate] ?? uaeFlatRate)]),
+    );
 
     res.json({
-      sameStatePerKmRate: Number(map["SHIPPING_SAME_STATE_PER_KM"] ?? 5),
-      sameStateFreeKmThreshold: Number(map["SHIPPING_SAME_STATE_FREE_KM"] ?? 10),
-      noLocationFlatRate: Number(map["SHIPPING_NO_LOCATION_FLAT"] ?? 50),
-      stateRates,
-      districtRates,
+      uaeFlatRate,
+      emirateRates,
       calculateShippingForCOD: map["SHIPPING_CALCULATE_COD"] !== "false" && map["SHIPPING_CALCULATE_COD"] !== false,
       calculateShippingForOnline: map["SHIPPING_CALCULATE_ONLINE"] !== "false" && map["SHIPPING_CALCULATE_ONLINE"] !== false,
-      calculateShippingForQR: map["SHIPPING_CALCULATE_QR"] !== "false" && map["SHIPPING_CALCULATE_QR"] !== false,
     });
   } catch (err: any) {
     logger.error("getShippingConfig error", err);
@@ -310,33 +289,30 @@ export const getShippingConfig = async (req: Request, res: Response) => {
 export const updateShippingConfig = async (req: Request, res: Response) => {
   try {
     const {
-      sameStatePerKmRate,
-      sameStateFreeKmThreshold,
-      noLocationFlatRate,
-      stateRates,
-      districtRates,
+      uaeFlatRate,
+      emirateRates,
       calculateShippingForCOD,
       calculateShippingForOnline,
-      calculateShippingForQR,
     } = req.body;
     const entries: Record<string, any> = {};
-    if (sameStatePerKmRate !== undefined) entries["SHIPPING_SAME_STATE_PER_KM"] = String(Number(sameStatePerKmRate));
-    if (sameStateFreeKmThreshold !== undefined) entries["SHIPPING_SAME_STATE_FREE_KM"] = String(Number(sameStateFreeKmThreshold));
-    if (noLocationFlatRate !== undefined) entries["SHIPPING_NO_LOCATION_FLAT"] = String(Number(noLocationFlatRate));
-    if (stateRates !== undefined) {
-      entries["SHIPPING_STATE_RATES"] = typeof stateRates === "string" ? stateRates : JSON.stringify(stateRates);
+    if (emirateRates !== undefined) {
+      const invalidEmirate = Object.keys(emirateRates).find((emirate) => !UAE_EMIRATES.includes(emirate as typeof UAE_EMIRATES[number]));
+      if (invalidEmirate) return res.status(400).json({ message: `Unsupported emirate: ${invalidEmirate}` });
+      const normalizedRates = Object.fromEntries(
+        UAE_EMIRATES.map((emirate) => [emirate, Number(emirateRates[emirate] ?? uaeFlatRate ?? 15)]),
+      );
+      entries["SHIPPING_UAE_EMIRATE_RATES_AED"] = JSON.stringify(normalizedRates);
+    } else if (uaeFlatRate !== undefined) {
+      entries["SHIPPING_UAE_EMIRATE_RATES_AED"] = JSON.stringify(
+        Object.fromEntries(UAE_EMIRATES.map((emirate) => [emirate, Number(uaeFlatRate)])),
+      );
     }
-    if (districtRates !== undefined) {
-      entries["SHIPPING_DISTRICT_RATES"] = typeof districtRates === "string" ? districtRates : JSON.stringify(districtRates);
-    }
+    if (uaeFlatRate !== undefined) entries["SHIPPING_UAE_FLAT_RATE_AED"] = String(Number(uaeFlatRate));
     if (calculateShippingForCOD !== undefined) {
       entries["SHIPPING_CALCULATE_COD"] = String(Boolean(calculateShippingForCOD));
     }
     if (calculateShippingForOnline !== undefined) {
       entries["SHIPPING_CALCULATE_ONLINE"] = String(Boolean(calculateShippingForOnline));
-    }
-    if (calculateShippingForQR !== undefined) {
-      entries["SHIPPING_CALCULATE_QR"] = String(Boolean(calculateShippingForQR));
     }
 
     await Promise.all(
@@ -349,8 +325,14 @@ export const updateShippingConfig = async (req: Request, res: Response) => {
       )
     );
 
-    // Clean up/delete old settings keys entirely
+    // Remove legacy Indian rate maps so they cannot be mistaken for active UAE settings.
     const oldKeys = [
+      "SHIPPING_SAME_STATE_PER_KM",
+      "SHIPPING_SAME_STATE_FREE_KM",
+      "SHIPPING_NO_LOCATION_FLAT",
+      "SHIPPING_STATE_RATES",
+      "SHIPPING_DISTRICT_RATES",
+      "SHIPPING_CALCULATE_QR",
       "SHIPPING_SAME_STATE",
       "SHIPPING_OTHER_STATE_FLAT",
       "SHIPPING_SAME_STATE_BASE",

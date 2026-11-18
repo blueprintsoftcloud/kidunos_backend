@@ -289,7 +289,7 @@ export const validateCoupon = async (req: Request, res: Response) => {
     }
     if (orderAmount < coupon.minOrderAmount) {
       res.status(400).json({
-        message: `Minimum order amount for this coupon is ₹${coupon.minOrderAmount}`,
+        message: `Minimum order amount for this coupon is AED ${coupon.minOrderAmount}`,
       });
       return;
     }

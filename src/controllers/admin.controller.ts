@@ -3,6 +3,8 @@ import bcrypt from "bcryptjs";
 import { User, Product, Order, OrderItem, StaffProfile } from "../models/mongoose";
 import logger from "../utils/logger";
 import { createAuditLog } from "../utils/auditLog";
+import { revokeUserSessions } from "../services/session.service";
+import { disconnectUserSockets } from "../socket/socketManager";
 
 const calculatePercentage = (current: number, previous: number): number => {
   if (previous === 0) return current === 0 ? 0 : 100;
@@ -163,6 +165,8 @@ export const getAdminSummary = async (req: Request, res: Response) => {
 export const getDashboardData = async (req: Request, res: Response) => {
   try {
     const now = new Date();
+    const currencyCondition = "AED";
+    const withCurrency = (match: Record<string, unknown>) => ({ ...match, currency: currencyCondition });
     const sevenDaysAgo = daysAgo(7);
     const thirtyDaysAgo = daysAgo(30);
     const sixtyDaysAgo = daysAgo(60);
@@ -227,15 +231,15 @@ export const getDashboardData = async (req: Request, res: Response) => {
       // Top products
       topProductItems,
     ] = await Promise.all([
-      Order.aggregate([{ $match: { paymentStatus: "PAID", ...totalDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
-      Order.aggregate([{ $match: { paymentStatus: "PAID", ...windowDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
-      Order.aggregate([{ $match: { paymentStatus: "PAID", ...prevDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
-      Order.countDocuments(totalDateFilter),
-      Order.countDocuments(windowDateFilter),
-      Order.countDocuments(prevDateFilter),
-      Order.aggregate([{ $match: { paymentStatus: "PAID", ...todayDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
-      Order.countDocuments(todayDateFilter),
-      Order.countDocuments({ orderStatus: "PROCESSING" }),
+      Order.aggregate([{ $match: withCurrency({ paymentStatus: "PAID", ...totalDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
+      Order.aggregate([{ $match: withCurrency({ paymentStatus: "PAID", ...windowDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
+      Order.aggregate([{ $match: withCurrency({ paymentStatus: "PAID", ...prevDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
+      Order.countDocuments(withCurrency(totalDateFilter)),
+      Order.countDocuments(withCurrency(windowDateFilter)),
+      Order.countDocuments(withCurrency(prevDateFilter)),
+      Order.aggregate([{ $match: withCurrency({ paymentStatus: "PAID", ...todayDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }]),
+      Order.countDocuments(withCurrency(todayDateFilter)),
+      Order.countDocuments(withCurrency({ orderStatus: "PROCESSING" })),
       User.countDocuments({ role: "CUSTOMER", ...totalDateFilter }),
       User.countDocuments({ role: "CUSTOMER", ...windowDateFilter }),
       User.countDocuments({ role: "CUSTOMER", ...prevDateFilter }),
@@ -243,7 +247,7 @@ export const getDashboardData = async (req: Request, res: Response) => {
       // Last 7 days revenue chart — grouped by day in the database, not by fetching
       // every matching order into Node and looping.
       Order.aggregate([
-        { $match: { paymentStatus: "PAID", createdAt: { $gte: sevenDaysAgo } } },
+        { $match: withCurrency({ paymentStatus: "PAID", createdAt: { $gte: sevenDaysAgo } }) },
         {
           $group: {
             _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
@@ -253,12 +257,12 @@ export const getDashboardData = async (req: Request, res: Response) => {
         },
       ]),
       // Order status breakdown
-      Order.countDocuments({ orderStatus: "PROCESSING" }),
-      Order.countDocuments({ orderStatus: "CONFIRMED" }),
-      Order.countDocuments({ orderStatus: "SHIPPED" }),
-      Order.countDocuments({ orderStatus: "DELIVERED" }),
-      Order.countDocuments({ orderStatus: "CANCELLED" }),
-      Order.countDocuments({ orderStatus: "RETURNED" }),
+      Order.countDocuments(withCurrency({ orderStatus: "PROCESSING" })),
+      Order.countDocuments(withCurrency({ orderStatus: "CONFIRMED" })),
+      Order.countDocuments(withCurrency({ orderStatus: "SHIPPED" })),
+      Order.countDocuments(withCurrency({ orderStatus: "DELIVERED" })),
+      Order.countDocuments(withCurrency({ orderStatus: "CANCELLED" })),
+      Order.countDocuments(withCurrency({ orderStatus: "RETURNED" })),
       // Low stock: products with stock <= 10, ordered by stock asc
       Product.find({ stock: { $lte: 10 } })
         .select('id name stock image')
@@ -266,14 +270,14 @@ export const getDashboardData = async (req: Request, res: Response) => {
         .sort({ stock: 1 })
         .limit(50),
       // Recent orders
-      Order.find()
-        .select('id finalAmount orderStatus paymentStatus paymentMethod createdAt shippingAddress')
+      Order.find(withCurrency({}))
+        .select('id finalAmount currency orderStatus paymentStatus paymentMethod createdAt shippingAddress')
         .populate('userId', 'username email')
         .sort({ createdAt: -1 })
         .limit(20),
       // Payment methods — now scoped to the selected range, same as the summary cards.
-      Order.aggregate([{ $match: { paymentMethod: "ONLINE", ...totalDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" }, count: { $sum: 1 } } }]),
-      Order.aggregate([{ $match: { paymentMethod: "POD", ...totalDateFilter } }, { $group: { _id: null, total: { $sum: "$finalAmount" }, count: { $sum: 1 } } }]),
+      Order.aggregate([{ $match: withCurrency({ paymentMethod: "ONLINE", ...totalDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" }, count: { $sum: 1 } } }]),
+      Order.aggregate([{ $match: withCurrency({ paymentMethod: "POD", ...totalDateFilter }) }, { $group: { _id: null, total: { $sum: "$finalAmount" }, count: { $sum: 1 } } }]),
       // Category revenue — a single aggregation pipeline joining OrderItem → Order (to
       // filter PAID + the selected date range) → Product → Category and grouping by
       // category, replacing what used to be up to 5,000 orders and 50,000 order items
@@ -281,7 +285,7 @@ export const getDashboardData = async (req: Request, res: Response) => {
       OrderItem.aggregate([
         { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
         { $unwind: "$order" },
-        { $match: { "order.paymentStatus": "PAID", ...orderDateMatch } },
+        { $match: { "order.paymentStatus": "PAID", "order.currency": currencyCondition, ...orderDateMatch } },
         { $lookup: { from: "products", localField: "productId", foreignField: "_id", as: "product" } },
         { $unwind: "$product" },
         {
@@ -303,7 +307,7 @@ export const getDashboardData = async (req: Request, res: Response) => {
       OrderItem.aggregate([
         { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
         { $unwind: "$order" },
-        { $match: { "order.paymentStatus": "PAID", ...orderDateMatch } },
+        { $match: { "order.paymentStatus": "PAID", "order.currency": currencyCondition, ...orderDateMatch } },
         { $group: { _id: "$productId", totalPrice: { $sum: { $multiply: ["$price", "$quantity"] } }, totalQuantity: { $sum: "$quantity" } } },
         { $sort: { totalPrice: -1 } },
         { $limit: 20 }
@@ -349,6 +353,7 @@ export const getDashboardData = async (req: Request, res: Response) => {
 
     res.json({
       summary: {
+        currency: "AED",
         revenue: {
           total: totalRevenueAgg[0]?.total ?? 0,
           thisMonth: thisMonthRevenueAgg[0]?.total ?? 0,
@@ -501,17 +506,18 @@ export const createAdminUser = async (req: Request, res: Response) => {
 export const updateUser = async (req: Request, res: Response) => {
   try {
     const id = req.params.id as string;
-    const { username, phone } = req.body as {
+    const { username, phone, isActive } = req.body as {
       username?: string;
       email?: string;
       phone?: string;
+      isActive?: boolean;
     };
     // Normalize once — emails are matched/stored case-insensitively everywhere.
     const email: string | undefined = req.body.email !== undefined
       ? (req.body.email ? String(req.body.email).trim().toLowerCase() : req.body.email)
       : undefined;
 
-    const existing = await User.findById(id).select('id role');
+    const existing = await User.findById(id).select("id role email isActive");
     if (!existing) return res.status(404).json({ message: "User not found." });
     if (existing.role === "SUPER_ADMIN") {
       return res.status(403).json({ message: "Cannot modify a Super Admin account." });
@@ -524,29 +530,44 @@ export const updateUser = async (req: Request, res: Response) => {
       if (phone) orConditions.push({ phone });
       const conflict = await User.findOne({
         _id: { $ne: id },
-        $or: orConditions
-      }).select('id');
+        $or: orConditions,
+      }).select("id");
       if (conflict) {
         return res.status(400).json({ message: "Email or phone already in use by another account." });
       }
     }
+
+    const emailChanged =
+      email !== undefined &&
+      (existing.email ?? "").trim().toLowerCase() !== String(email ?? "").trim().toLowerCase();
+    const deactivated = typeof isActive === "boolean" && isActive === false && existing.isActive !== false;
 
     const updated = await User.findByIdAndUpdate(
       id,
       {
         ...(username !== undefined && { username }),
         ...(email !== undefined && { email }),
+        ...(emailChanged && { emailVerifiedAt: null }),
         ...(phone !== undefined && { phone }),
+        ...(typeof isActive === "boolean" && { isActive }),
       },
-      { new: true }
-    ).select('id username email phone role');
+      { new: true },
+    ).select("id username email phone role isActive");
+
+    if (emailChanged || deactivated) {
+      await revokeUserSessions(
+        req.app.get("socketio"),
+        id,
+        deactivated ? "USER_DEACTIVATED" : "USER_EMAIL_UPDATED",
+      );
+    }
 
     await createAuditLog({
       req,
       action: "UPDATE_USER",
       entity: "User",
       entityId: id,
-      details: { username, email, phone },
+      details: { username, email, phone, isActive },
     });
 
     return res.json({ message: "User updated successfully.", user: updated });
@@ -561,7 +582,7 @@ export const deleteUser = async (req: Request, res: Response) => {
   try {
     const id = req.params.id as string;
 
-    const target = await User.findById(id).select('id role');
+    const target = await User.findById(id).select("id role");
     if (!target) return res.status(404).json({ message: "User not found." });
     if (target.role === "SUPER_ADMIN") {
       return res.status(403).json({ message: "Cannot delete a Super Admin account." });
@@ -570,10 +591,14 @@ export const deleteUser = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "You cannot delete your own account." });
     }
 
+    const io = req.app.get("socketio");
+    let cascadedStaffUserIds: string[] = [];
+
     if (target.role === "ADMIN") {
       // Find all staff profiles managed by this admin
       const staffProfiles = await StaffProfile.find({ managedBy: id });
       const staffUserIds = staffProfiles.map((sp) => sp.userId);
+      cascadedStaffUserIds = staffUserIds.map((uid) => String(uid));
 
       // Delete staff profiles
       await StaffProfile.deleteMany({ managedBy: id });
@@ -585,6 +610,11 @@ export const deleteUser = async (req: Request, res: Response) => {
     }
 
     await User.findByIdAndDelete(id);
+    disconnectUserSockets(io, id, "USER_DELETED");
+    for (const staffUserId of cascadedStaffUserIds) {
+      disconnectUserSockets(io, staffUserId, "USER_DELETED");
+    }
+
     await createAuditLog({ req, action: "DELETE_USER", entity: "User", entityId: id, details: { role: target.role } });
     return res.json({ message: "User deleted successfully." });
   } catch (err: any) {

@@ -18,8 +18,9 @@ export const OTP_EXPIRY_MINUTES = 5;
 
 export const generateOtpCode = (): string => {
   const min = Math.pow(10, OTP_LENGTH - 1);
-  const max = Math.pow(10, OTP_LENGTH) - 1;
-  return crypto.randomInt(min, max).toString();
+  // crypto.randomInt upper bound is exclusive, so 10^OTP_LENGTH covers 100000..999999 inclusively.
+  const maxExclusive = Math.pow(10, OTP_LENGTH);
+  return crypto.randomInt(min, maxExclusive).toString();
 };
 
 // ── OTP — shared by signup verification, login, password reset, and email-change ──
@@ -43,12 +44,13 @@ export const orderConfirmationEmailPayload = (
   customerName: string,
   totalAmount: string,
   paymentMethod: "ONLINE" | "POD",
+  currency: "AED" = "AED",
 ) => ({
   templateId: env.MSG91_TEMPLATE_ORDER_CONFIRMATION,
   variables: {
     ORDER_ID: orderShortId,
     CUSTOMER_NAME: customerName,
-    TOTAL_AMOUNT: totalAmount,
+    TOTAL_AMOUNT: `${currency} ${totalAmount}`,
     PAYMENT_METHOD_LABEL: paymentMethod === "POD" ? "Pay on Delivery" : "Online Payment",
     PAYMENT_STATUS_MESSAGE: paymentMethod === "POD" ? "You will pay on delivery." : "Your payment has been received.",
   },

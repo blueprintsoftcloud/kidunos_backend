@@ -29,7 +29,7 @@ export const STAFF_PERMISSIONS = [
   "BANNER_ADD",
   "BANNER_EDIT",
   "BANNER_DELETE",
-  // Warehouse & Shipping Settings
+  // Shipping Settings
   "SETTINGS_VIEW",
   "SETTINGS_EDIT",
   // Payments (payment transaction logs — distinct from Order Management)
@@ -93,10 +93,10 @@ export const PERMISSION_GROUPS = [
     ],
   },
   {
-    label: "Warehouse & Shipping Settings",
+    label: "Shipping Settings",
     permissions: [
-      { key: "SETTINGS_VIEW" as StaffPermission, label: "View Warehouse & Shipping Settings" },
-      { key: "SETTINGS_EDIT" as StaffPermission, label: "Edit Warehouse & Shipping Settings" },
+      { key: "SETTINGS_VIEW" as StaffPermission, label: "View Shipping Settings" },
+      { key: "SETTINGS_EDIT" as StaffPermission, label: "Edit Shipping Settings" },
     ],
   },
   {

@@ -34,6 +34,10 @@ export interface IUser extends Document {
   password?: string;
   role: string;
   isVerified: boolean;
+  isActive: boolean;
+  tokenVersion: number;
+  emailVerifiedAt?: Date | null;
+  posActivationRequired?: boolean;
   refreshToken?: string;
   avatar?: string;
   /** Refresh-token-reuse detection: the token family id currently valid for this user. */
@@ -53,6 +57,10 @@ const UserSchema = new Schema<IUser>(
     password: String,
     role: { type: String, enum: RoleEnum, default: 'CUSTOMER' },
     isVerified: { type: Boolean, default: false },
+    isActive: { type: Boolean, default: true },
+    tokenVersion: { type: Number, default: 0 },
+    emailVerifiedAt: { type: Date, default: null },
+    posActivationRequired: { type: Boolean, default: false },
     refreshToken: String,
     refreshTokenFamily: String,
     previousRefreshToken: String,
@@ -95,8 +103,8 @@ const AddressSchema = new Schema<IAddress>(
     fullAddress: { type: String, required: true },
     city: { type: String, required: true },
     state: { type: String, required: true },
-    zipCode: { type: String, required: true },
-    country: { type: String, default: 'India' },
+    zipCode: { type: String, default: '' },
+    country: { type: String, default: 'United Arab Emirates' },
     locality: String,
     landmark: String,
     isDefault: { type: Boolean, default: false },
@@ -193,6 +201,7 @@ export interface IProduct extends Document {
   specifications?: IProductSpecification[];
   purchasePrice?: number;
   price: number;
+  currency: string;
   stock: number;
   stockQuantity: number;
   sizes: string[];
@@ -238,6 +247,7 @@ const ProductSchema = new Schema<IProduct>(
     },
     purchasePrice: Number,
     price: { type: Number, required: true },
+    currency: { type: String, default: "AED" },
     stock: { type: Number, default: 0 },
     stockQuantity: { type: Number, default: 0 },
     sizes: { type: [String], default: [] },
@@ -380,6 +390,7 @@ export interface IProductVariant extends Document {
   optionsKey: string;
   sku?: string;
   stock: number;
+  currency: string;
   /** Falls back to Product.price when null — most variants don't need a price
    * different from the base product, only a stock count of their own. */
   priceOverride: number | null;
@@ -413,6 +424,7 @@ const ProductVariantSchema = new Schema<IProductVariant>(
     optionsKey: { type: String, required: true },
     sku: String,
     stock: { type: Number, default: 0 },
+    currency: { type: String, default: "AED" },
     priceOverride: { type: Number, default: null },
     purchasePriceOverride: { type: Number, default: null },
     discountOverride: { type: Number, default: null },
@@ -496,6 +508,8 @@ export interface IOrder extends Document {
   discountAmount: number;
   taxAmount: number;
   finalAmount: number;
+  /** Currency recorded at order creation; older orders are explicitly migrated as INR. */
+  currency?: string;
   paymentMethod: string;
   paymentStatus: string;
   orderStatus: string;
@@ -503,6 +517,7 @@ export interface IOrder extends Document {
   razorpayPaymentId?: string;
   razorpaySignature?: string;
   transactionId?: string;
+  nomodCheckoutId?: string;
   paymentScreenshot?: string;
   shippingAddress: any;
   couponId?: mongoose.Types.ObjectId;
@@ -544,6 +559,7 @@ const OrderSchema = new Schema<IOrder>(
     discountAmount: { type: Number, default: 0 },
     taxAmount: { type: Number, default: 0 },
     finalAmount: { type: Number, required: true },
+    currency: String,
     paymentMethod: { type: String, enum: PaymentMethodEnum, required: true },
     paymentStatus: { type: String, enum: PaymentStatusEnum, default: 'PENDING' },
     orderStatus: { type: String, enum: OrderStatusEnum, default: 'PROCESSING' },
@@ -551,6 +567,7 @@ const OrderSchema = new Schema<IOrder>(
     razorpayPaymentId: String,
     razorpaySignature: String,
     transactionId: String,
+    nomodCheckoutId: String,
     paymentScreenshot: String,
     shippingAddress: { type: Schema.Types.Mixed, required: true },
     couponId: { type: Schema.Types.ObjectId, ref: 'Coupon' },
@@ -753,6 +770,7 @@ export interface ICoupon extends Document {
   description?: string;
   discountType: string;
   discountValue: number;
+  currency: string;
   minOrderAmount: number;
   maxUses?: number;
   usedCount: number;
@@ -770,6 +788,7 @@ const CouponSchema = new Schema<ICoupon>(
     description: String,
     discountType: { type: String, enum: ['PERCENTAGE', 'FLAT'], required: true },
     discountValue: { type: Number, required: true },
+    currency: { type: String, default: "AED" },
     minOrderAmount: { type: Number, default: 0 },
     maxUses: Number,
     usedCount: { type: Number, default: 0 },
@@ -917,6 +936,7 @@ export interface IPaymentLog extends Document {
   userId: mongoose.Types.ObjectId;
   orderId: mongoose.Types.ObjectId;
   amount: number;
+  currency?: string;
   event?: string;
   paymentStatus: string;
   paymentMethod: string;
@@ -937,6 +957,7 @@ const PaymentLogSchema = new Schema<IPaymentLog>(
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     orderId: { type: Schema.Types.ObjectId, ref: 'Order', required: true },
     amount: { type: Number, required: true },
+    currency: String,
     event: String,
     paymentStatus: { type: String, enum: PaymentStatusEnum, required: true },
     paymentMethod: { type: String, enum: PaymentMethodEnum, required: true },
@@ -1121,6 +1142,196 @@ export const CancellationFeedback = mongoose.model<ICancellationFeedback>(
   'CancellationFeedback',
   CancellationFeedbackSchema
 );
+
+// ───────────────────────────── OTP CHALLENGE / RATE LIMIT / EMAIL OUTBOX ────
+
+export const OtpPurposeEnum = [
+  'customer_signup',
+  'customer_login',
+  'admin_login',
+  'password_reset',
+  'profile_update',
+  'pos_counter_verify',
+] as const;
+export type OtpPurpose = (typeof OtpPurposeEnum)[number];
+
+export const OutboxStatusEnum = [
+  'pending',
+  'processing',
+  'sent',
+  'failed',
+  'suppressed',
+  'ambiguous_timeout',
+] as const;
+export type OutboxStatus = (typeof OutboxStatusEnum)[number];
+
+export interface IOtpChallenge extends Document {
+  challengeId: string;
+  email: string;
+  purpose: OtpPurpose;
+  otpHash?: string | null;
+  challengeNonce: string;
+  isDecoy: boolean;
+  authVerified: boolean;
+  userId?: mongoose.Types.ObjectId | null;
+  tokenVersionSnapshot?: number | null;
+  pendingData?: any;
+  attempts: number;
+  maxAttempts: number;
+  resendCount: number;
+  maxResends: number;
+  lastSentAt: Date;
+  lastAttemptAt?: Date | null;
+  expiresAt: Date;
+  consumedAt?: Date | null;
+  lockedAt?: Date | null;
+  invalidatedAt?: Date | null;
+  outboxId?: string | null;
+  deliveryStatus: string;
+  resetTokenJti?: string | null;
+  resetTokenExpiresAt?: Date | null;
+  resetTokenConsumedAt?: Date | null;
+  cleanupAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const OtpChallengeSchema = new Schema<IOtpChallenge>(
+  {
+    challengeId: { type: String, required: true },
+    email: { type: String, required: true },
+    purpose: { type: String, enum: OtpPurposeEnum, required: true },
+    otpHash: { type: String, default: null },
+    challengeNonce: { type: String, required: true },
+    isDecoy: { type: Boolean, default: false },
+    authVerified: { type: Boolean, default: false },
+    userId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    tokenVersionSnapshot: { type: Number, default: null },
+    pendingData: { type: Schema.Types.Mixed, default: null },
+    attempts: { type: Number, default: 0 },
+    maxAttempts: { type: Number, default: 5 },
+    resendCount: { type: Number, default: 0 },
+    maxResends: { type: Number, default: 3 },
+    lastSentAt: { type: Date, required: true },
+    lastAttemptAt: { type: Date, default: null },
+    expiresAt: { type: Date, required: true },
+    consumedAt: { type: Date, default: null },
+    lockedAt: { type: Date, default: null },
+    invalidatedAt: { type: Date, default: null },
+    outboxId: { type: String, default: null },
+    deliveryStatus: { type: String, default: 'pending' },
+    resetTokenJti: { type: String, default: undefined },
+    resetTokenExpiresAt: { type: Date, default: null },
+    resetTokenConsumedAt: { type: Date, default: null },
+    cleanupAt: { type: Date, required: true },
+  },
+  { timestamps: true }
+);
+
+OtpChallengeSchema.index({ challengeId: 1 }, { unique: true });
+OtpChallengeSchema.index(
+  { email: 1, purpose: 1 },
+  {
+    unique: true,
+    name: 'otp_active_email_purpose_unique',
+    partialFilterExpression: {
+      consumedAt: { $type: 'null' },
+      invalidatedAt: { $type: 'null' },
+    },
+  }
+);
+OtpChallengeSchema.index({ email: 1, purpose: 1, createdAt: -1 });
+OtpChallengeSchema.index({ userId: 1, purpose: 1, createdAt: -1 });
+OtpChallengeSchema.index({ resetTokenJti: 1 }, { sparse: true });
+OtpChallengeSchema.index({ cleanupAt: 1 }, { expireAfterSeconds: 0 });
+
+export const OtpChallenge = mongoose.model<IOtpChallenge>('OtpChallenge', OtpChallengeSchema);
+
+export interface IOtpRateLimit extends Document {
+  key: string;
+  scope: string;
+  count: number;
+  resetAt: Date;
+  lastActionAt?: Date | null;
+  cleanupAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const OtpRateLimitSchema = new Schema<IOtpRateLimit>(
+  {
+    key: { type: String, required: true },
+    scope: { type: String, required: true },
+    count: { type: Number, default: 0 },
+    resetAt: { type: Date, required: true },
+    lastActionAt: { type: Date, default: null },
+    cleanupAt: { type: Date, required: true },
+  },
+  { timestamps: true }
+);
+
+OtpRateLimitSchema.index({ key: 1 }, { unique: true });
+OtpRateLimitSchema.index({ cleanupAt: 1 }, { expireAfterSeconds: 0 });
+
+export const OtpRateLimit = mongoose.model<IOtpRateLimit>('OtpRateLimit', OtpRateLimitSchema);
+
+export interface IEmailOutbox extends Document {
+  outboxId: string;
+  status: OutboxStatus;
+  challengeId: string;
+  purpose: OtpPurpose;
+  encryptedPayload?: string | null;
+  encryptionKeyVersion: number;
+  attempts: number;
+  maxAttempts: number;
+  nextAttemptAt: Date;
+  lockedAt?: Date | null;
+  lockedBy?: string | null;
+  sentAt?: Date | null;
+  failedAt?: Date | null;
+  errorCode?: string | null;
+  cleanupAt?: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const EmailOutboxSchema = new Schema<IEmailOutbox>(
+  {
+    outboxId: { type: String, required: true },
+    status: { type: String, enum: OutboxStatusEnum, default: 'pending' },
+    challengeId: { type: String, required: true },
+    purpose: { type: String, enum: OtpPurposeEnum, required: true },
+    encryptedPayload: { type: String, default: null },
+    encryptionKeyVersion: { type: Number, default: 1 },
+    attempts: { type: Number, default: 0 },
+    maxAttempts: { type: Number, default: 3 },
+    nextAttemptAt: { type: Date, required: true },
+    lockedAt: { type: Date, default: null },
+    lockedBy: { type: String, default: null },
+    sentAt: { type: Date, default: null },
+    failedAt: { type: Date, default: null },
+    errorCode: { type: String, default: null },
+    cleanupAt: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
+EmailOutboxSchema.index({ outboxId: 1 }, { unique: true });
+EmailOutboxSchema.index({ status: 1, nextAttemptAt: 1 });
+EmailOutboxSchema.index({ status: 1, lockedAt: 1 });
+EmailOutboxSchema.index({ challengeId: 1 });
+EmailOutboxSchema.index(
+  { cleanupAt: 1 },
+  {
+    expireAfterSeconds: 0,
+    name: 'email_outbox_terminal_cleanup_ttl',
+    partialFilterExpression: {
+      status: { $in: ['sent', 'failed', 'suppressed', 'ambiguous_timeout'] },
+    },
+  }
+);
+
+export const EmailOutbox = mongoose.model<IEmailOutbox>('EmailOutbox', EmailOutboxSchema);
 
 // ── Aliases ───────────────────────────────────────────────────────────────────
 export const Attribute = CategoryAttribute;

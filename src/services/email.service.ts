@@ -9,7 +9,11 @@
 // background retry.
 
 import { AppSetting } from "../models/mongoose";
-import { sendMsg91TemplateEmail, Msg91TemplateEmailData } from "../config/msg91Email";
+import {
+  hasMsg91EmailConfig,
+  sendMsg91TemplateEmail,
+  Msg91TemplateEmailData,
+} from "../config/msg91Email";
 import { withRetry } from "../utils/retry";
 import { env } from "../config/env";
 import logger from "../utils/logger";
@@ -17,6 +21,17 @@ import logger from "../utils/logger";
 export type EmailJobData = Msg91TemplateEmailData;
 
 export const sendEmail = async (data: EmailJobData): Promise<void> => {
+  // Handle missing required configuration explicitly before background dispatch for OTP emails.
+  if (data.throwOnMissingConfig && !hasMsg91EmailConfig(data.templateId)) {
+    logger.error("[email] missing required MSG91 email configuration for OTP delivery", {
+      hasAuthKey: Boolean(env.MSG91_AUTH_KEY),
+      hasTemplateId: Boolean(data.templateId),
+      hasDomain: Boolean(env.MSG91_EMAIL_DOMAIN),
+      hasFrom: Boolean(env.MSG91_EMAIL_FROM),
+    });
+    throw new Error("MSG91 email configuration is incomplete for OTP delivery.");
+  }
+
   // One shared MSG91 account/domain/auth key sends every email, but the business
   // should still control what name they read as coming from (see the
   // MSG91_EMAIL_FROM_NAME AppSetting managed on the Company Settings page) —

@@ -93,7 +93,7 @@ export const productList = async (req: Request, res: Response) => {
     // Product.price is only the CHEAPEST active variant's price (syncProductFromVariants)
     // — the admin product grid showing that bare number reads as "the" price even
     // though other options can cost much more. Attach each variant product's actual
-    // min–max range so the card can show "₹X – ₹Y" instead of one misleadingly
+    // min–max range so the card can show "AED X – AED Y" instead of one misleadingly
     // specific figure. One batch query for the whole page rather than N+1.
     const productIds = list.map((p: any) => p.id);
     const variants = productIds.length
@@ -930,4 +930,3 @@ export const quickStockUpdate = async (req: Request, res: Response) => {
     res.status(500).json({ message: "Error updating stock", error: err.message });
   }
 };
-

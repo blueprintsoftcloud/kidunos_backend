@@ -10,53 +10,80 @@ import {
   registerCustomer,
   checkPhoneExists,
   getMsg91WidgetConfig,
+  getCustomerAuthConfig,
+  customerSignupRequestOtp,
+  customerSignupResendOtp,
+  customerSignupVerifyOtp,
+  customerLoginRequestOtp,
+  customerLoginResendOtp,
+  customerLoginVerifyOtp,
 } from "../controllers/auth.controller";
 import {
   forgotPassword,
+  resendResetOtp,
   verifyResetOtp,
   resetPassword,
 } from "../controllers/passwordReset.controller";
 import jwt from "jsonwebtoken";
 import { env } from "../config/env";
-import { optionalAuthMiddleware } from "../middleware/optionalAuth.middleware";
+import { clearAuthCookies } from "../config/tokens";
+import {
+  validateActiveSessionUser,
+  type DecodedSessionClaims,
+} from "../services/session.service";
 import {
   loginLimiter,
   otpLimiter,
-  signupLimiter,
   passwordResetLimiter,
 } from "../middleware/rateLimit.middleware";
 import { validate } from "../middleware/validate.middleware";
 import {
-  signupSchema,
   loginSchema,
   verifyOtpSchema,
   resendOtpSchema,
   forgotPasswordSchema,
+  forgotPasswordResendSchema,
   resetPasswordSchema,
+  customerSignupRequestSchema,
+  customerSignupResendSchema,
+  customerSignupVerifySchema,
+  customerLoginRequestSchema,
+  customerLoginResendSchema,
+  customerLoginVerifySchema,
   mobileLoginSchema,
   mobileRegisterSchema,
-  checkPhoneSchema,
 } from "../schemas/auth.schema";
 
 const router = Router();
 
-router.post("/signup", signupLimiter, validate(signupSchema), signup);
+// Public CSRF bootstrap endpoint — sets csrfToken cookie (via ensureCsrfCookie) and
+// returns it with Cache-Control: no-store so clients can ensure a token before mutating calls.
+router.get("/csrf", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const token =
+    (req.cookies?.csrfToken as string | undefined) ||
+    (res.locals.generatedCsrfToken as string | undefined) ||
+    "";
+  return res.status(200).json({ csrfToken: token });
+});
+
+// Legacy public signup permanently disabled (410 Gone)
+router.post("/signup", signup);
 router.post("/login", loginLimiter, validate(loginSchema), login);
 router.post("/refresh", refreshTokens);
 router.post("/logout", logout);
 router.post("/login/verify", loginLimiter, validate(verifyOtpSchema), verifyLoginOtp);
 router.post("/resend-otp", otpLimiter, validate(resendOtpSchema), resendOtp);
 router.post("/forgot-password", passwordResetLimiter, validate(forgotPasswordSchema), forgotPassword);
+router.post("/forgot-password/resend-otp", passwordResetLimiter, validate(forgotPasswordResendSchema), resendResetOtp);
 router.post("/verify-reset-otp", passwordResetLimiter, validate(verifyOtpSchema), verifyResetOtp);
 router.post("/reset-password", passwordResetLimiter, validate(resetPasswordSchema), resetPassword);
-router.get("/status", (req, res) => {
+
+router.get("/status", async (req, res) => {
   const token = req.cookies?.jwt as string | undefined;
   const hasRefreshToken = !!req.cookies?.refreshToken;
 
   if (!token) {
-    // No JWT — if a refresh token exists the session can be silently renewed.
-    // Return 401 so the frontend interceptor calls /auth/refresh automatically.
-    // If there is no refresh token either, the user is a genuine guest.
     if (hasRefreshToken) {
       return res.status(401).json({ message: "Access token expired." });
     }
@@ -64,22 +91,39 @@ router.get("/status", (req, res) => {
   }
 
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as { id: string; email: string; role: string };
-    return res.status(200).json({ isLoggedIn: true, role: decoded.role });
+    const decoded = jwt.verify(token, env.JWT_SECRET) as DecodedSessionClaims;
+    const validation = await validateActiveSessionUser(decoded);
+    if (!validation.valid) {
+      if (validation.clearCookies && (!hasRefreshToken || validation.code !== "LEGACY_TOKEN")) {
+        clearAuthCookies(res);
+      }
+      return res.status(401).json({
+        isLoggedIn: false,
+        role: null,
+        message: validation.message,
+        code: validation.code,
+      });
+    }
+    return res.status(200).json({ isLoggedIn: true, role: validation.user.role });
   } catch (err: unknown) {
     if ((err as { name?: string }).name === "TokenExpiredError") {
-      // Access token has expired — signal the frontend interceptor to refresh
       return res.status(401).json({ message: "Access token expired." });
     }
-    // Tampered or otherwise invalid token — treat as guest
     return res.status(200).json({ isLoggedIn: false, role: null });
   }
 });
 
-// ── Mobile OTP auth via MSG91 Widget ─────────────────────────────────────────
-// All OTP send/verify calls happen browser-side. Backend only validates the
-// resulting access token with MSG91's verifyAccessToken server endpoint.
-router.post("/mobile/check-phone", otpLimiter, validate(checkPhoneSchema), checkPhoneExists);
+// ── Customer Email OTP auth (PR 2, feature-gated until PR 4 cutover) ─────────
+router.get("/customer/config", getCustomerAuthConfig);
+router.post("/customer/signup/request-otp", otpLimiter, validate(customerSignupRequestSchema), customerSignupRequestOtp);
+router.post("/customer/signup/resend-otp", otpLimiter, validate(customerSignupResendSchema), customerSignupResendOtp);
+router.post("/customer/signup/verify-otp", loginLimiter, validate(customerSignupVerifySchema), customerSignupVerifyOtp);
+router.post("/customer/login/request-otp", otpLimiter, validate(customerLoginRequestSchema), customerLoginRequestOtp);
+router.post("/customer/login/resend-otp", otpLimiter, validate(customerLoginResendSchema), customerLoginResendOtp);
+router.post("/customer/login/verify-otp", loginLimiter, validate(customerLoginVerifySchema), customerLoginVerifyOtp);
+
+// ── Mobile OTP auth via MSG91 Widget (hardened prep window) ──────────────────
+router.post("/mobile/check-phone", otpLimiter, checkPhoneExists);
 router.post("/mobile/login", otpLimiter, validate(mobileLoginSchema), mobileLogin);
 router.post("/mobile/register", otpLimiter, validate(mobileRegisterSchema), registerCustomer);
 router.get("/mobile/widget-config", getMsg91WidgetConfig);

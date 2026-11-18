@@ -1,9 +1,12 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { User, StaffProfile, Product, Order } from "../models/mongoose";
+import { User, StaffProfile, Product, Order, OrderItem } from "../models/mongoose";
 import { STAFF_PERMISSIONS, StaffPermission } from "../config/staffPermissions";
 import logger from "../utils/logger";
 import { createAuditLog } from "../utils/auditLog";
+import { revokeUserSessions } from "../services/session.service";
+import { disconnectUserSockets } from "../socket/socketManager";
+import { normalizeIndianMobile, normalizeUaeMobile } from "../utils/identity";
 
 // ── GET /api/staff/profile  (staff's own profile + permissions) ────────────
 export const getMyProfile = async (req: Request, res: Response) => {
@@ -63,8 +66,10 @@ export const updateMyProfile = async (req: Request, res: Response) => {
 };
 
 // ── GET /api/staff/dashboard  (staff: own dashboard summary) ─────────────
-export const getStaffDashboard = async (_req: Request, res: Response) => {
+export const getStaffDashboard = async (req: Request, res: Response) => {
   try {
+    const currencyCondition = "AED";
+    const mongoCurrencyCondition = "AED";
     const now = new Date();
     const thirtyDaysAgo = new Date(now);
     thirtyDaysAgo.setDate(now.getDate() - 30);
@@ -85,27 +90,27 @@ export const getStaffDashboard = async (_req: Request, res: Response) => {
       processingOrders,
       paidAgg, paidThisMonth, paidPrevMonth,
     ] = await Promise.all([
-      prisma.order.count(),
-      prisma.order.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
-      prisma.order.count({ where: { createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
+      prisma.order.count({ where: { currency: currencyCondition } }),
+      prisma.order.count({ where: { currency: currencyCondition, createdAt: { gte: thirtyDaysAgo } } }),
+      prisma.order.count({ where: { currency: currencyCondition, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
       prisma.product.count(),
       prisma.category.count(),
-      prisma.order.count({ where: { orderStatus: "PROCESSING" } }),
-      prisma.order.aggregate({ where: { paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] } }, _sum: { finalAmount: true } }),
-      prisma.order.aggregate({ where: { paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] }, createdAt: { gte: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
-      prisma.order.aggregate({ where: { paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] }, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
+      prisma.order.count({ where: { currency: currencyCondition, orderStatus: "PROCESSING" } }),
+      prisma.order.aggregate({ where: { currency: currencyCondition, paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] } }, _sum: { finalAmount: true } }),
+      prisma.order.aggregate({ where: { currency: currencyCondition, paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] }, createdAt: { gte: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
+      prisma.order.aggregate({ where: { currency: currencyCondition, paymentStatus: "PAID", orderStatus: { notIn: ["CANCELLED", "RETURNED"] }, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
     ]);
 
     // Order status breakdown (pie chart)
     const statuses = ["PROCESSING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "RETURNED"] as const;
     const statusCounts = await Promise.all(
-      statuses.map((s) => prisma.order.count({ where: { orderStatus: s } })),
+      statuses.map((s) => prisma.order.count({ where: { currency: currencyCondition, orderStatus: s } })),
     );
     const orderStatus = statuses.map((s, i) => ({ status: s, count: statusCounts[i] }));
 
     // Revenue by day — last 7 days (bar chart), grouped in the database
     const revenueByDayAgg = await Order.aggregate([
-      { $match: { paymentStatus: "PAID", orderStatus: { $nin: ["CANCELLED", "RETURNED"] }, createdAt: { $gte: sevenDaysAgo } } },
+      { $match: { currency: mongoCurrencyCondition, paymentStatus: "PAID", orderStatus: { $nin: ["CANCELLED", "RETURNED"] }, createdAt: { $gte: sevenDaysAgo } } },
       {
         $group: {
           _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
@@ -126,33 +131,45 @@ export const getStaffDashboard = async (_req: Request, res: Response) => {
     }
 
     // Top 5 products by sales
-    const topProductsRaw = await prisma.orderItem.groupBy({
-      by: ["productId"],
-      _sum: { quantity: true, price: true },
-      _count: { id: true },
-      orderBy: { _sum: { price: "desc" } },
-      take: 5,
-    });
-    const productIds = topProductsRaw.map((p: any) => p.productId).filter(Boolean) as string[];
+    const topProductsRaw = await OrderItem.aggregate([
+      { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
+      { $unwind: "$order" },
+      { $match: { "order.currency": mongoCurrencyCondition, "order.paymentStatus": "PAID" } },
+      {
+        $group: {
+          _id: "$productId",
+          totalRevenue: { $sum: { $multiply: ["$price", "$quantity"] } },
+          totalQuantitySold: { $sum: "$quantity" },
+          orderCount: { $sum: 1 },
+        },
+      },
+      { $sort: { totalRevenue: -1 } },
+      { $limit: 5 },
+    ]);
+    const productIds = topProductsRaw
+      .map((product: { _id?: unknown }) => product._id ? String(product._id) : null)
+      .filter((id): id is string => id !== null);
     const productDetails = await prisma.product.findMany({
       where: { id: { in: productIds } },
       select: { id: true, name: true, image: true, price: true },
     });
     const productMap = Object.fromEntries(productDetails.map((p: any) => [p.id, p]));
     const topProducts = topProductsRaw.map((p: any) => ({
-      product: p.productId ? productMap[p.productId] ?? null : null,
-      totalRevenue: p._sum.price ?? 0,
-      totalQuantitySold: p._sum.quantity ?? 0,
-      orderCount: p._count.id,
+      product: p._id ? productMap[String(p._id)] ?? null : null,
+      totalRevenue: p.totalRevenue ?? 0,
+      totalQuantitySold: p.totalQuantitySold ?? 0,
+      orderCount: p.orderCount ?? 0,
     }));
 
     // Recent orders (last 5) for orders table widget
     const recentOrders = await prisma.order.findMany({
+      where: { currency: currencyCondition },
       orderBy: { createdAt: "desc" },
       take: 5,
       select: {
         id: true,
         finalAmount: true,
+        currency: true,
         orderStatus: true,
         paymentStatus: true,
         paymentMethod: true,
@@ -165,6 +182,7 @@ export const getStaffDashboard = async (_req: Request, res: Response) => {
     // Payment method breakdown (COD vs ONLINE)
     const paymentMethodsRaw = await prisma.order.groupBy({
       by: ["paymentMethod"],
+      where: { currency: currencyCondition },
       _count: { id: true },
       _sum: { finalAmount: true },
     });
@@ -181,6 +199,7 @@ export const getStaffDashboard = async (_req: Request, res: Response) => {
         products: { total: totalProducts },
         categories: { total: totalCategories },
       },
+      currency: "AED",
       orderStatus,
       revenueChart: Object.values(byDay),
       topProducts,
@@ -295,8 +314,9 @@ export const createStaff = async (req: Request, res: Response) => {
       res.status(400).json({ message: "Invalid email address format" });
       return;
     }
-    if (!/^[6-9][0-9]{9}$/.test(String(phone))) {
-      res.status(400).json({ message: "Phone must be a valid 10-digit Indian mobile number" });
+    const normalizedPhone = normalizeUaeMobile(phone) ?? normalizeIndianMobile(phone);
+    if (!normalizedPhone) {
+      res.status(400).json({ message: "Phone must be a valid UAE or legacy Indian mobile number" });
       return;
     }
     if (password.length < 6) {
@@ -314,7 +334,7 @@ export const createStaff = async (req: Request, res: Response) => {
       res.status(409).json({ message: "An account with this email address already exists." });
       return;
     }
-    const phoneExists = await prisma.user.findFirst({ where: { phone: String(phone) } });
+    const phoneExists = await prisma.user.findFirst({ where: { phone: normalizedPhone } });
     if (phoneExists) {
       res.status(409).json({ message: "An account with this phone number already exists." });
       return;
@@ -328,7 +348,7 @@ export const createStaff = async (req: Request, res: Response) => {
         data: {
           username,
           email,
-          phone: String(phone),
+          phone: normalizedPhone,
           password: hashedPassword,
           role: "STAFF",
           isVerified: true,
@@ -413,6 +433,7 @@ export const updateStaff = async (req: Request, res: Response) => {
     };
     // Normalize once — emails are matched/stored case-insensitively everywhere.
     const email: string | undefined = req.body.email ? String(req.body.email).trim().toLowerCase() : req.body.email;
+    const normalizedPhone = phone ? normalizeUaeMobile(phone) ?? normalizeIndianMobile(phone) : undefined;
 
     const profile = await prisma.staffProfile.findFirst({
       where: { id: id as string },
@@ -437,13 +458,13 @@ export const updateStaff = async (req: Request, res: Response) => {
       }
     }
 
-    if (phone && !/^[6-9][0-9]{9}$/.test(String(phone))) {
-      res.status(400).json({ message: "Phone must be a valid 10-digit Indian mobile number" });
+    if (phone && !normalizedPhone) {
+      res.status(400).json({ message: "Phone must be a valid UAE or legacy Indian mobile number" });
       return;
     }
     if (phone) {
       const phoneConflict = await prisma.user.findFirst({
-        where: { phone: String(phone), id: { not: profile.userId } },
+        where: { phone: normalizedPhone, id: { not: profile.userId } },
       });
       if (phoneConflict) {
         res.status(409).json({ message: "Another account with this phone number already exists" });
@@ -463,14 +484,34 @@ export const updateStaff = async (req: Request, res: Response) => {
       }
     }
 
+    const passwordChanged = !!(newPassword && newPassword.length >= 6);
+    const existingStaffUser = await prisma.user.findUnique({
+      where: { id: profile.userId },
+      select: { email: true },
+    });
+    const emailChanged =
+      Boolean(email) &&
+      (existingStaffUser?.email ?? "").trim().toLowerCase() !== email!.trim().toLowerCase();
+
     const [updatedUser, updatedProfile] = await prisma.$transaction(async (tx: any) => {
       const userUpdateData: Record<string, any> = {
         ...(username && { username }),
         ...(email && { email }),
-        ...(phone && { phone: String(phone) }),
+        ...(normalizedPhone && { phone: normalizedPhone }),
       };
-      if (newPassword && newPassword.length >= 6) {
+      if (passwordChanged) {
         userUpdateData.password = await bcrypt.hash(newPassword, 10);
+      }
+      if (emailChanged) {
+        userUpdateData.emailVerifiedAt = null;
+      }
+      if (passwordChanged || emailChanged) {
+        userUpdateData.tokenVersion = { increment: 1 };
+        userUpdateData.refreshToken = null;
+        userUpdateData.previousRefreshToken = null;
+        userUpdateData.previousRefreshTokens = [];
+        userUpdateData.refreshTokenFamily = null;
+        userUpdateData.lastRotatedAt = null;
       }
       return [
         await tx.user.update({
@@ -484,6 +525,14 @@ export const updateStaff = async (req: Request, res: Response) => {
         }),
       ];
     });
+
+    if (passwordChanged || emailChanged) {
+      disconnectUserSockets(
+        req.app.get("socketio"),
+        String(profile.userId),
+        passwordChanged ? "STAFF_PASSWORD_UPDATED" : "STAFF_EMAIL_UPDATED",
+      );
+    }
 
     await createAuditLog({
       req,
@@ -569,6 +618,14 @@ export const toggleStaffActive = async (req: Request, res: Response) => {
       data: { isActive: !profile.isActive },
     });
 
+    if (updated.isActive === false) {
+      await revokeUserSessions(
+        req.app.get("socketio"),
+        String(profile.userId),
+        "STAFF_DEACTIVATED",
+      );
+    }
+
     await createAuditLog({
       req,
       action: "TOGGLE_STAFF_ACTIVE",
@@ -608,6 +665,7 @@ export const deleteStaff = async (req: Request, res: Response) => {
     // Mongoose has no cascade, so both must be deleted explicitly.
     await prisma.staffProfile.delete({ where: { id: id as string } });
     await prisma.user.delete({ where: { id: profile.userId } });
+    disconnectUserSockets(req.app.get("socketio"), String(profile.userId), "STAFF_DELETED");
 
     await createAuditLog({
       req,

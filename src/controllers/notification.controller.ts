@@ -10,7 +10,7 @@ export const getMyNotifications = async (req: Request, res: Response) => {
       where: { recipientId: userId },
       include: {
         triggeredBy: { select: { id: true, username: true, email: true } },
-        order: { select: { id: true, finalAmount: true, orderStatus: true } },
+        order: { select: { id: true, finalAmount: true, orderStatus: true, currency: true } },
       },
       orderBy: { createdAt: "desc" },
       take: 50,
@@ -101,7 +101,7 @@ export const getUserNotifications = async (req: Request, res: Response) => {
       // Needed so the navbar dropdown (Navbar.tsx) can deep-link a click straight to
       // the order the notification is about, same as getMyNotifications above.
       include: {
-        order: { select: { id: true, finalAmount: true, orderStatus: true } },
+        order: { select: { id: true, finalAmount: true, orderStatus: true, currency: true } },
       },
       orderBy: { createdAt: "desc" },
       take: 50,

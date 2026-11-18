@@ -1,184 +1,908 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { User, Otp, StaffProfile } from "../models/mongoose";
-import { generateToken } from "../config/tokens";
+import mongoose from "mongoose";
+import { User, StaffProfile } from "../models/mongoose";
 import {
-  generateOtpCode,
-  otpEmailPayload,
-  OTP_EXPIRY_MINUTES,
-} from "../config/mailer";
+  clearAuthCookies,
+  generateToken,
+  getAuthCookieOptions,
+  hashRefreshTokenValue,
+  timingSafeEqualToken,
+} from "../config/tokens";
 import { env } from "../config/env";
 import logger from "../utils/logger";
-import { sendEmail } from "../services/email.service";
+import {
+  hasValidTokenVersionClaim,
+  revokeUserSessions,
+} from "../services/session.service";
+import {
+  escapeRegex,
+  normalizeEmail,
+  normalizeUaeMobile,
+  normalizeStrictUaePhone,
+} from "../utils/identity";
+import { isCustomerEmailOtpEnabled } from "../utils/featureFlags";
+import {
+  ensureOtpCollectionsInitialized,
+  issueChallengeAndEnqueueOutbox,
+  resendChallengeAndEnqueueOutbox,
+  TxAbortError,
+  verifyChallengeOtp,
+} from "../services/otp.service";
+import {
+  signAdminLoginChallengeCookie,
+  verifyAdminLoginChallengeCookie,
+} from "../utils/otpCrypto";
 
-// POST /api/auth/signup
-export const signup = async (req: Request, res: Response) => {
+const ADMIN_CHALLENGE_COOKIE_NAME = "admin_login_challenge";
+
+const clearAdminChallengeCookie = (res: Response): void => {
+  res.clearCookie(ADMIN_CHALLENGE_COOKIE_NAME, {
+    ...getAuthCookieOptions(),
+    path: "/",
+  });
+};
+
+const isDuplicateKeyError = (err: unknown): boolean => {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: number; cause?: { code?: number } };
+  return e.code === 11000 || e.cause?.code === 11000;
+};
+
+const extractVerifiedPhoneFromMsg91 = (body: Record<string, unknown>): string | null => {
+  const dataObj =
+    body.data && typeof body.data === "object"
+      ? (body.data as Record<string, unknown>)
+      : undefined;
+
+  const candidates: unknown[] = [
+    body.mobile,
+    body.phone,
+    body.identifier,
+    dataObj?.mobile,
+    dataObj?.phone,
+    dataObj?.identifier,
+    dataObj?.message,
+    body.message,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeUaeMobile(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+};
+
+// POST /api/auth/signup — Permanently retired (legacy unauthenticated password/first-admin path)
+export const signup = async (_req: Request, res: Response) => {
+  return res.status(410).json({
+    message:
+      "Legacy public signup has been permanently disabled. Please use the customer registration flow.",
+    code: "ENDPOINT_RETIRED",
+  });
+};
+
+// GET /api/auth/customer/config — Public runtime feature flags for customer auth UX
+export const getCustomerAuthConfig = async (_req: Request, res: Response) => {
+  res.setHeader("Cache-Control", "no-store");
+  const customerEmailOtpEnabled = await isCustomerEmailOtpEnabled();
+  return res.status(200).json({
+    customerEmailOtpEnabled,
+    customerSmsOtpEnabled: true,
+  });
+};
+
+// POST /api/auth/customer/signup/request-otp (feature-gated PR 2 customer email signup)
+export const customerSignupRequestOtp = async (req: Request, res: Response) => {
   try {
-    const { username, phone, password } = req.body;
-    // Emails are matched/stored case-insensitively everywhere in this app — normalize
-    // once at the boundary so "Foo@Gmail.com" and "foo@gmail.com" are always the same
-    // account instead of silently becoming two.
-    const email: string | undefined = req.body.email ? String(req.body.email).trim().toLowerCase() : undefined;
-
-    const emailExists = email
-      ? await User.findOne({ email })
-      : null;
-    if (emailExists) {
-      return res.status(400).json({ Error: "An account with this email address already exists." });
-    }
-    const phoneExists = phone
-      ? await User.findOne({ phone: String(phone) })
-      : null;
-    if (phoneExists) {
-      return res.status(400).json({ Error: "An account with this phone number already exists." });
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const { name, email, phone } = req.body as {
+      name?: unknown;
+      email?: unknown;
+      phone?: unknown;
+    };
 
-    // Architecture: 1 SUPER_ADMIN (seeded only) + N ADMIN (partners running the same
-    // business) + N CUSTOMERS.
-    // - SUPER_ADMIN is never created via signup; the seed script is the only path.
-    // - First signup becomes ADMIN.
-    // - Every subsequent signup is CUSTOMER.
-    const adminExists = await User.findOne({ role: "ADMIN" });
-    const role = adminExists ? "CUSTOMER" : "ADMIN";
+    const cleanName = typeof name === "string" ? name.trim() : "";
+    if (!cleanName || cleanName.length < 2 || cleanName.length > 80) {
+      return res.status(400).json({
+        message: "Valid full name (2-80 characters) is required.",
+      });
+    }
 
-    const user = await User.create({
-      username,
-      email,
-      phone: String(phone),
-      password: hashedPassword,
-      role,
-    });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ message: "Valid email address is required." });
+    }
 
-    await generateToken(
-      { id: user.id, email: user.email ?? "", role: user.role },
-      res,
-    );
+    const submittedPhone = normalizeStrictUaePhone(phone);
+    if (!submittedPhone) {
+      return res.status(400).json({
+        message: "Enter a valid 9-digit UAE mobile number starting with 5.",
+      });
+    }
 
-    return res.status(201).json({
-      message:
-        role === "ADMIN"
-          ? "Admin User created successfully"
-          : "User created successfully",
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
+    const existing = await User.findOne({
+      $or: [
+        { phone: submittedPhone },
+        { email: normalizedEmail },
+        { email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } },
+      ],
+    })
+      .select("_id")
+      .lean();
+
+    const isDecoy = Boolean(existing);
+
+    const issued = await issueChallengeAndEnqueueOutbox({
+      purpose: "customer_signup",
+      email: normalizedEmail,
+      toName: cleanName,
+      ip: req.ip,
+      phone: submittedPhone,
+      isDecoy,
+      pendingData: {
+        name: cleanName,
+        email: normalizedEmail,
+        phone: submittedPhone,
       },
     });
-  } catch (err: any) {
-    logger.error("signup error", err);
-    if (err?.code === "P2002") {
-      const field = err?.meta?.target?.includes("email") ? "email address" : "phone number";
-      return res.status(400).json({ Error: `An account with this ${field} already exists.` });
+
+    if (!issued.ok) {
+      return res.status(issued.httpStatus).json({
+        message: issued.message,
+        code: issued.code,
+        ...(issued.retryAfterSeconds ? { retryAfterSeconds: issued.retryAfterSeconds } : {}),
+      });
     }
-    return res
-      .status(500)
-      .json({ Error: "Server error", details: err.message });
+
+    return res.status(200).json({
+      message:
+        "If these details are eligible for registration, a 6-digit verification code has been sent to your email.",
+      challengeId: issued.challengeId,
+      step: "VERIFY_OTP",
+      expiresInSeconds: issued.expiresInSeconds,
+      resendAfterSeconds: issued.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("customerSignupRequestOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Unable to initiate signup verification." });
   }
 };
 
-// POST /api/auth/login  — Step 1: validate credentials, send OTP
-export const login = async (req: Request, res: Response) => {
+// POST /api/auth/customer/signup/resend-otp (feature-gated PR 2 customer email signup)
+export const customerSignupResendOtp = async (req: Request, res: Response) => {
   try {
-    const { password } = req.body;
-    const email: string | undefined = req.body.email ? String(req.body.email).trim().toLowerCase() : undefined;
-    if (!email) return res.status(400).json({ message: "Email is required" });
-
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ message: "No account registered with this email" });
-
-    if (!user.password) {
-      return res.status(400).json({ message: "This account uses mobile OTP login. Please sign in with your mobile number." });
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch)
+    const { email, challengeId } = req.body as { email?: unknown; challengeId?: string };
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !challengeId) {
+      return res
+        .status(400)
+        .json({ message: "Valid email and verification session are required." });
+    }
+
+    const resendRes = await resendChallengeAndEnqueueOutbox({
+      purpose: "customer_signup",
+      email: normalizedEmail,
+      challengeId,
+      ip: req.ip,
+    });
+
+    if (!resendRes.ok) {
+      return res.status(resendRes.httpStatus).json({
+        message: resendRes.message,
+        code: resendRes.code,
+        ...(resendRes.retryAfterSeconds
+          ? { retryAfterSeconds: resendRes.retryAfterSeconds }
+          : {}),
+      });
+    }
+
+    return res.status(200).json({
+      message:
+        "If these details are eligible for registration, a new 6-digit verification code has been sent.",
+      challengeId: resendRes.challengeId,
+      step: "VERIFY_OTP",
+      expiresInSeconds: resendRes.expiresInSeconds,
+      resendAfterSeconds: resendRes.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("customerSignupResendOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Unable to resend verification code." });
+  }
+};
+
+// POST /api/auth/customer/signup/verify-otp (feature-gated PR 2 customer email signup)
+export const customerSignupVerifyOtp = async (req: Request, res: Response) => {
+  try {
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
+    }
+
+    const { email, challengeId, otp } = req.body as {
+      email?: unknown;
+      challengeId?: string;
+      otp?: string;
+    };
+
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !challengeId || !otp) {
+      return res
+        .status(400)
+        .json({ message: "Email, verification session, and 6-digit code are required." });
+    }
+
+    await ensureOtpCollectionsInitialized();
+
+    const session = await mongoose.startSession();
+    let createdUser: { id: string; username: string; email: string; role: string } | null = null;
+    let failureResponse: {
+      httpStatus: number;
+      code: string;
+      message: string;
+      attemptsRemaining?: number;
+      retryAfterSeconds?: number;
+    } | null = null;
+
+    try {
+      await session.withTransaction(async () => {
+        createdUser = null;
+        failureResponse = null;
+
+        const verifyRes = await verifyChallengeOtp({
+          purpose: "customer_signup",
+          email: normalizedEmail,
+          otp,
+          challengeId,
+          ip: req.ip,
+          session,
+        });
+
+        if (!verifyRes.ok) {
+          failureResponse = {
+            httpStatus: verifyRes.httpStatus,
+            code: verifyRes.code,
+            message: verifyRes.message,
+            attemptsRemaining: verifyRes.attemptsRemaining,
+            retryAfterSeconds: verifyRes.retryAfterSeconds,
+          };
+          throw new TxAbortError();
+        }
+
+        const pending = (verifyRes.challenge.pendingData ?? {}) as {
+          name?: unknown;
+          email?: unknown;
+          phone?: unknown;
+        };
+
+        const cleanName = typeof pending.name === "string" ? pending.name.trim() : "";
+        const pendingEmail = normalizeEmail(pending.email);
+        const pendingPhone = normalizeStrictUaePhone(pending.phone);
+
+        if (
+          !cleanName ||
+          !pendingEmail ||
+          pendingEmail !== normalizedEmail ||
+          !pendingPhone
+        ) {
+          failureResponse = {
+            httpStatus: 400,
+            code: "CHALLENGE_INVALID",
+            message: "Verification session payload is invalid. Please sign up again.",
+          };
+          throw new TxAbortError();
+        }
+
+        const existingConflict = await User.findOne({
+          $or: [
+            { phone: pendingPhone },
+            { email: pendingEmail },
+            { email: { $regex: `^${escapeRegex(pendingEmail)}$`, $options: "i" } },
+          ],
+        })
+          .select("_id")
+          .session(session)
+          .lean();
+
+        if (existingConflict) {
+          failureResponse = {
+            httpStatus: 409,
+            code: "SIGNUP_CONFLICT",
+            message:
+              "Unable to complete registration with these details. Please sign in or use different details.",
+          };
+          throw new TxAbortError();
+        }
+
+        const newUser = new User({
+          username: cleanName,
+          email: pendingEmail,
+          phone: pendingPhone,
+          role: "CUSTOMER",
+          isVerified: true,
+          emailVerifiedAt: new Date(),
+          isActive: true,
+          tokenVersion: 0,
+          posActivationRequired: false,
+        });
+
+        await newUser.save({ session });
+        createdUser = {
+          id: newUser.id,
+          username: newUser.username,
+          email: pendingEmail,
+          role: newUser.role,
+        };
+      });
+    } catch (txErr: unknown) {
+      if (!(txErr instanceof TxAbortError)) {
+        if (isDuplicateKeyError(txErr)) {
+          return res.status(409).json({
+            message:
+              "Unable to complete registration with these details. Please sign in or use different details.",
+            code: "SIGNUP_CONFLICT",
+          });
+        }
+        throw txErr;
+      }
+    } finally {
+      await session.endSession();
+    }
+
+    if (failureResponse) {
+      const f = failureResponse as {
+        httpStatus: number;
+        code: string;
+        message: string;
+        attemptsRemaining?: number;
+        retryAfterSeconds?: number;
+      };
+      return res.status(f.httpStatus).json({
+        message: f.message,
+        code: f.code,
+        ...(typeof f.attemptsRemaining === "number"
+          ? { attemptsRemaining: f.attemptsRemaining }
+          : {}),
+        ...(f.retryAfterSeconds ? { retryAfterSeconds: f.retryAfterSeconds } : {}),
+      });
+    }
+
+    if (!createdUser) {
+      return res.status(500).json({ message: "Unable to complete registration." });
+    }
+
+    const userSummary = createdUser as {
+      id: string;
+      username: string;
+      email: string;
+      role: string;
+    };
+
+    await generateToken(
+      {
+        id: userSummary.id,
+        email: userSummary.email,
+        role: userSummary.role,
+        tokenVersion: 0,
+      },
+      res,
+    );
+
+    logger.info("customerSignupVerifyOtp: created customer account", {
+      id: userSummary.id,
+    });
+    return res.status(201).json({
+      message: "Account created successfully. Welcome!",
+      user: {
+        id: userSummary.id,
+        username: userSummary.username,
+        role: userSummary.role,
+      },
+    });
+  } catch (err: unknown) {
+    logger.error("customerSignupVerifyOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Error verifying signup code." });
+  }
+};
+
+// POST /api/auth/customer/login/request-otp (feature-gated PR 2 customer email login)
+export const customerLoginRequestOtp = async (req: Request, res: Response) => {
+  try {
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
+    }
+
+    const normalizedEmail = normalizeEmail(req.body?.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ message: "Valid email address is required." });
+    }
+
+    const user = await User.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } },
+      ],
+    })
+      .select("_id username email role isActive emailVerifiedAt posActivationRequired")
+      .lean();
+
+    const isEligibleCustomer =
+      Boolean(user) &&
+      user!.role === "CUSTOMER" &&
+      user!.isActive !== false &&
+      Boolean(user!.emailVerifiedAt) &&
+      !user!.posActivationRequired;
+
+    const issued = await issueChallengeAndEnqueueOutbox({
+      purpose: "customer_login",
+      email: normalizedEmail,
+      toName: isEligibleCustomer ? user!.username : normalizedEmail,
+      ip: req.ip,
+      isDecoy: !isEligibleCustomer,
+      userId: isEligibleCustomer ? user!._id : null,
+    });
+
+    if (!issued.ok) {
+      return res.status(issued.httpStatus).json({
+        message: issued.message,
+        code: issued.code,
+        ...(issued.retryAfterSeconds ? { retryAfterSeconds: issued.retryAfterSeconds } : {}),
+      });
+    }
+
+    return res.status(200).json({
+      message:
+        "If an eligible customer account exists for this email, a 6-digit verification code has been sent.",
+      challengeId: issued.challengeId,
+      step: "VERIFY_OTP",
+      expiresInSeconds: issued.expiresInSeconds,
+      resendAfterSeconds: issued.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("customerLoginRequestOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Unable to initiate login verification." });
+  }
+};
+
+// POST /api/auth/customer/login/resend-otp (feature-gated PR 2 customer email login)
+export const customerLoginResendOtp = async (req: Request, res: Response) => {
+  try {
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
+    }
+
+    const { email, challengeId } = req.body as { email?: unknown; challengeId?: string };
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !challengeId) {
+      return res
+        .status(400)
+        .json({ message: "Valid email and verification session are required." });
+    }
+
+    const resendRes = await resendChallengeAndEnqueueOutbox({
+      purpose: "customer_login",
+      email: normalizedEmail,
+      challengeId,
+      ip: req.ip,
+    });
+
+    if (!resendRes.ok) {
+      return res.status(resendRes.httpStatus).json({
+        message: resendRes.message,
+        code: resendRes.code,
+        ...(resendRes.retryAfterSeconds
+          ? { retryAfterSeconds: resendRes.retryAfterSeconds }
+          : {}),
+      });
+    }
+
+    return res.status(200).json({
+      message:
+        "If an eligible customer account exists for this email, a new 6-digit verification code has been sent.",
+      challengeId: resendRes.challengeId,
+      step: "VERIFY_OTP",
+      expiresInSeconds: resendRes.expiresInSeconds,
+      resendAfterSeconds: resendRes.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("customerLoginResendOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Unable to resend verification code." });
+  }
+};
+
+// POST /api/auth/customer/login/verify-otp (feature-gated PR 2 customer email login)
+export const customerLoginVerifyOtp = async (req: Request, res: Response) => {
+  try {
+    if (!(await isCustomerEmailOtpEnabled())) {
+      return res.status(403).json({
+        message: "Customer email OTP authentication is not enabled.",
+        code: "FEATURE_DISABLED",
+      });
+    }
+
+    const { email, challengeId, otp } = req.body as {
+      email?: unknown;
+      challengeId?: string;
+      otp?: string;
+    };
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !challengeId || !otp) {
+      return res
+        .status(400)
+        .json({ message: "Email, verification session, and 6-digit code are required." });
+    }
+
+    const verifyRes = await verifyChallengeOtp({
+      purpose: "customer_login",
+      email: normalizedEmail,
+      otp,
+      challengeId,
+      ip: req.ip,
+    });
+
+    if (!verifyRes.ok) {
+      return res.status(verifyRes.httpStatus).json({
+        message: verifyRes.message,
+        code: verifyRes.code,
+        ...(typeof verifyRes.attemptsRemaining === "number"
+          ? { attemptsRemaining: verifyRes.attemptsRemaining }
+          : {}),
+        ...(verifyRes.retryAfterSeconds
+          ? { retryAfterSeconds: verifyRes.retryAfterSeconds }
+          : {}),
+      });
+    }
+
+    const boundUserId = verifyRes.challenge.userId;
+    if (!boundUserId) {
+      return res.status(401).json({
+        message: "Verification session is not bound to an account.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
+
+    const user = await User.findById(boundUserId);
+    if (!user || normalizeEmail(user.email) !== normalizedEmail) {
+      return res.status(401).json({
+        message: "Account state changed. Please request a new login code.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
+
+    if (user.role !== "CUSTOMER") {
+      return res.status(403).json({
+        message: "This account cannot sign in via customer email login.",
+        code: "ROLE_RESTRICTED",
+      });
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact support.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    if (!user.emailVerifiedAt || user.posActivationRequired) {
+      return res.status(403).json({
+        message: "Email verification is required before signing in via Email OTP.",
+        code: "EMAIL_NOT_VERIFIED",
+      });
+    }
+
+    await generateToken(
+      {
+        id: user.id,
+        email: normalizedEmail,
+        role: user.role,
+        tokenVersion: user.tokenVersion ?? 0,
+      },
+      res,
+    );
+
+    return res.status(200).json({
+      message: "Login successful.",
+      user: { id: user.id, username: user.username, role: user.role },
+    });
+  } catch (err: unknown) {
+    logger.error("customerLoginVerifyOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Server error during login verification." });
+  }
+};
+
+// POST /api/auth/login — Step 1: validate staff/admin credentials, issue challenge + EmailOutbox
+export const login = async (req: Request, res: Response) => {
+  try {
+    const { password } = req.body as { password?: string };
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ message: "Email is required" });
+
+    const user = await User.findOne({
+      $or: [
+        { email },
+        { email: { $regex: `^${escapeRegex(email)}$`, $options: "i" } },
+      ],
+    });
+    if (!user) {
+      return res.status(400).json({ message: "No account registered with this email" });
+    }
+
+    // Legacy CUSTOMER password hashes remain untouched in MongoDB but are unreachable via password login.
+    if (user.role === "CUSTOMER") {
+      return res.status(403).json({
+        message: "Customer accounts cannot sign in through staff/admin password login.",
+        code: "ROLE_RESTRICTED",
+      });
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact your administrator.",
+      });
+    }
+
+    if (!user.password) {
+      return res.status(400).json({
+        message: "Password login is not enabled for this account.",
+      });
+    }
+
+    const isMatch = await bcrypt.compare(password ?? "", user.password);
+    if (!isMatch) {
       return res.status(400).json({ message: "Password is incorrect" });
+    }
 
-    // ── Subscription barrier removed (admins can login unconditionally)
-
-    // ── Staff Active Status Barrier (shift-left)
-    if (user.role === 'STAFF') {
-      const staffProfile = await StaffProfile.findOne({ userId: user._id });
-      
-      // If the profile doesn't exist or isActive is false, block them instantly
+    if (user.role === "STAFF") {
+      const staffProfile = await StaffProfile.findOne({ userId: user._id }).lean();
       if (!staffProfile || staffProfile.isActive === false) {
         return res.status(403).json({
-          message: 'Your account has been deactivated. Please contact your administrator for access.',
+          message: "Your account has been deactivated. Please contact your administrator for access.",
         });
       }
     }
 
-    // Clear old OTPs, create new
-    await Otp.deleteMany({ email });
-    const otpCode = generateOtpCode();
-    const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
+    const tokenVersionSnapshot = typeof user.tokenVersion === "number" ? user.tokenVersion : 0;
+    const issued = await issueChallengeAndEnqueueOutbox({
+      purpose: "admin_login",
+      email,
+      toName: user.username,
+      ip: req.ip,
+      authVerified: true,
+      userId: user._id,
+      tokenVersionSnapshot,
+    });
 
-    await Otp.create({ email, otp: otpCode, expiresAt });
+    if (!issued.ok) {
+      return res.status(issued.httpStatus).json({
+        message: issued.message,
+        code: issued.code,
+        ...(issued.retryAfterSeconds ? { retryAfterSeconds: issued.retryAfterSeconds } : {}),
+      });
+    }
 
-    await sendEmail({
-      to: email,
-      ...otpEmailPayload(otpCode, "log in to your account"),
+    const cookieToken = signAdminLoginChallengeCookie({
+      challengeId: issued.challengeId,
+      userId: user.id,
+      email,
+      tokenVersionSnapshot,
+    });
+
+    res.cookie(ADMIN_CHALLENGE_COOKIE_NAME, cookieToken, {
+      maxAge: 15 * 60 * 1000,
+      ...getAuthCookieOptions(),
+      path: "/",
     });
 
     return res.status(200).json({
       message: "Credentials verified. OTP sent to your email.",
       step: "VERIFY_OTP",
       email,
+      challengeId: issued.challengeId,
+      expiresInSeconds: issued.expiresInSeconds,
+      resendAfterSeconds: issued.resendAfterSeconds,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     logger.error("login error", err);
-    return res
-      .status(500)
-      .json({ error: "Error occurred", details: err.message });
+    return res.status(500).json({
+      error: "Error occurred",
+      message: err instanceof Error ? err.message : "Server error",
+    });
   }
 };
 
-// POST /api/auth/verify-otp  — Step 2: verify OTP, issue tokens
+// POST /api/auth/login/verify — Step 2: verify challenge cookie + OTP, issue versioned tokens
 export const verifyLoginOtp = async (req: Request, res: Response) => {
   try {
-    const { otp } = req.body;
-    const email: string | undefined = req.body.email ? String(req.body.email).trim().toLowerCase() : undefined;
-
-    const otpRecord = await Otp.findOne({ email, otp });
-
-    if (!otpRecord) {
-      return res.status(401).json({ message: "Invalid or expired OTP." });
+    const { otp, challengeId: bodyChallengeId } = req.body as {
+      otp?: string;
+      challengeId?: string;
+    };
+    const email = normalizeEmail(req.body?.email);
+    if (!email) {
+      return res.status(400).json({ message: "Valid email is required." });
     }
 
-    // Check expiry
-    if (otpRecord.expiresAt && otpRecord.expiresAt < new Date()) {
-      await Otp.findByIdAndDelete(otpRecord._id);
-      return res
-        .status(401)
-        .json({ message: "OTP has expired. Please request a new one." });
+    const challengeClaims = verifyAdminLoginChallengeCookie(
+      req.cookies?.[ADMIN_CHALLENGE_COOKIE_NAME],
+    );
+    if (!challengeClaims) {
+      clearAdminChallengeCookie(res);
+      return res.status(401).json({
+        message: "Pre-authentication challenge session is missing or expired. Please log in again.",
+        code: "CHALLENGE_MISSING",
+      });
     }
 
-    // Consume OTP
-    await Otp.findByIdAndDelete(otpRecord._id);
+    if (challengeClaims.email !== email) {
+      return res.status(401).json({
+        message: "Verification session does not match the submitted email.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
 
-    const user = await User.findOne({ email });
-    if (!user)
-      return res.status(400).json({ message: "User record not found." });
+    if (bodyChallengeId && bodyChallengeId !== challengeClaims.challengeId) {
+      return res.status(401).json({
+        message: "Verification session mismatch. Please log in again.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
+
+    const user = await User.findById(challengeClaims.userId);
+    if (!user || normalizeEmail(user.email) !== email) {
+      clearAdminChallengeCookie(res);
+      return res.status(401).json({
+        message: "Account state changed. Please log in again.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
+
+    if (user.role === "CUSTOMER") {
+      clearAdminChallengeCookie(res);
+      return res.status(403).json({
+        message: "Customer accounts cannot sign in through staff/admin password login.",
+        code: "ROLE_RESTRICTED",
+      });
+    }
+
+    if (user.isActive === false) {
+      clearAdminChallengeCookie(res);
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact your administrator.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    if (user.role === "STAFF") {
+      const staffProfile = await StaffProfile.findOne({ userId: user._id }).lean();
+      if (!staffProfile || staffProfile.isActive === false) {
+        clearAdminChallengeCookie(res);
+        return res.status(403).json({
+          message: "Your account has been deactivated. Please contact your administrator.",
+          code: "ACCOUNT_DEACTIVATED",
+        });
+      }
+    }
+
+    const dbTokenVersion = typeof user.tokenVersion === "number" ? user.tokenVersion : 0;
+    if (dbTokenVersion !== challengeClaims.tokenVersionSnapshot) {
+      clearAdminChallengeCookie(res);
+      return res.status(401).json({
+        message: "Your session state changed. Please log in again.",
+        code: "TOKEN_VERSION_MISMATCH",
+      });
+    }
+
+    const verifyRes = await verifyChallengeOtp({
+      purpose: "admin_login",
+      email,
+      otp: otp ?? "",
+      challengeId: challengeClaims.challengeId,
+      userId: user._id,
+      requireAuthVerified: true,
+      expectedTokenVersion: dbTokenVersion,
+      ip: req.ip,
+    });
+
+    if (!verifyRes.ok) {
+      if (
+        verifyRes.code === "CHALLENGE_LOCKED" ||
+        verifyRes.code === "CHALLENGE_CONSUMED" ||
+        verifyRes.code === "CHALLENGE_EXPIRED" ||
+        verifyRes.code === "CHALLENGE_INVALID" ||
+        verifyRes.code === "TOKEN_VERSION_MISMATCH" ||
+        verifyRes.code === "AUTH_NOT_VERIFIED"
+      ) {
+        clearAdminChallengeCookie(res);
+      }
+      return res.status(verifyRes.httpStatus).json({
+        message: verifyRes.message,
+        code: verifyRes.code,
+        ...(typeof verifyRes.attemptsRemaining === "number"
+          ? { attemptsRemaining: verifyRes.attemptsRemaining }
+          : {}),
+        ...(verifyRes.retryAfterSeconds
+          ? { retryAfterSeconds: verifyRes.retryAfterSeconds }
+          : {}),
+      });
+    }
+
+    // Immediate pre-issuance recheck before minting auth cookies
+    const freshUser = await User.findById(user._id).lean();
+    if (
+      !freshUser ||
+      freshUser.role === "CUSTOMER" ||
+      freshUser.isActive === false ||
+      (freshUser.tokenVersion ?? 0) !== challengeClaims.tokenVersionSnapshot
+    ) {
+      clearAdminChallengeCookie(res);
+      return res.status(403).json({
+        message: "Account access could not be verified. Please log in again.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    if (freshUser.role === "STAFF") {
+      const freshStaffProfile = await StaffProfile.findOne({ userId: freshUser._id }).lean();
+      if (!freshStaffProfile || freshStaffProfile.isActive === false) {
+        clearAdminChallengeCookie(res);
+        return res.status(403).json({
+          message: "Your account has been deactivated. Please contact your administrator.",
+          code: "ACCOUNT_DEACTIVATED",
+        });
+      }
+    }
+
+    clearAdminChallengeCookie(res);
 
     await generateToken(
       {
-        id: user.id,
-        email: user.email ?? "",
-        role: user.role,
+        id: String(freshUser._id),
+        email,
+        role: freshUser.role,
+        tokenVersion: freshUser.tokenVersion ?? 0,
       },
       res,
     );
 
     return res.status(200).json({
       message: "Logged in successfully",
-      role: user.role,
+      role: freshUser.role,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     logger.error("verifyLoginOtp error", err);
     return res
       .status(500)
@@ -186,155 +910,255 @@ export const verifyLoginOtp = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/auth/resend-otp
+// POST /api/auth/resend-otp — requires valid pre-authenticated admin_login_challenge cookie
 export const resendOtp = async (req: Request, res: Response) => {
   try {
-    const email: string | undefined = req.body.email ? String(req.body.email).trim().toLowerCase() : undefined;
+    const email = normalizeEmail(req.body?.email);
     if (!email) return res.status(400).json({ message: "Email is required" });
 
-    const user = await User.findOne({ email });
-    // Generic response to avoid email enumeration
-    if (!user)
-      return res
-        .status(200)
-        .json({ message: "If registered, OTP has been sent." });
+    const challengeClaims = verifyAdminLoginChallengeCookie(
+      req.cookies?.[ADMIN_CHALLENGE_COOKIE_NAME],
+    );
+    if (!challengeClaims) {
+      clearAdminChallengeCookie(res);
+      return res.status(401).json({
+        message:
+          "Active pre-authentication challenge is required before resending OTP. Please log in again.",
+        code: "CHALLENGE_MISSING",
+      });
+    }
 
-    await Otp.deleteMany({ email });
-    const otpCode = generateOtpCode();
-    const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
+    if (challengeClaims.email !== email) {
+      return res.status(401).json({
+        message: "Login challenge does not match this email.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
 
-    await Otp.create({ email, otp: otpCode, expiresAt });
+    if (req.body?.challengeId && req.body.challengeId !== challengeClaims.challengeId) {
+      return res.status(401).json({
+        message: "Verification session mismatch.",
+        code: "CHALLENGE_INVALID",
+      });
+    }
 
-    await sendEmail({
-      to: email,
-      ...otpEmailPayload(otpCode, "log in to your account"),
+    const user = await User.findById(challengeClaims.userId).lean();
+    if (!user || normalizeEmail(user.email) !== email || user.role === "CUSTOMER" || user.isActive === false) {
+      clearAdminChallengeCookie(res);
+      return res.status(403).json({
+        message: "Account access is unavailable.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    if (user.role === "STAFF") {
+      const staffProfile = await StaffProfile.findOne({ userId: user._id }).lean();
+      if (!staffProfile || staffProfile.isActive === false) {
+        clearAdminChallengeCookie(res);
+        return res.status(403).json({
+          message: "Your account has been deactivated. Please contact your administrator.",
+          code: "ACCOUNT_DEACTIVATED",
+        });
+      }
+    }
+
+    const dbTokenVersion = typeof user.tokenVersion === "number" ? user.tokenVersion : 0;
+    if (dbTokenVersion !== challengeClaims.tokenVersionSnapshot) {
+      clearAdminChallengeCookie(res);
+      return res.status(401).json({
+        message: "Session state changed. Please log in again.",
+        code: "TOKEN_VERSION_MISMATCH",
+      });
+    }
+
+    const resendRes = await resendChallengeAndEnqueueOutbox({
+      purpose: "admin_login",
+      email,
+      challengeId: challengeClaims.challengeId,
+      userId: user._id,
+      requireAuthVerified: true,
+      expectedTokenVersion: dbTokenVersion,
+      ip: req.ip,
+      toName: user.username,
     });
 
-    return res
-      .status(200)
-      .json({ message: "New verification code sent to your email.", email });
-  } catch (err: any) {
-    logger.error("resendOtp error", err);
-    return res
-      .status(500)
-      .json({ error: "Error occurred during resend", details: err.message });
-  }
-};
+    if (!resendRes.ok) {
+      if (
+        resendRes.code === "CHALLENGE_LOCKED" ||
+        resendRes.code === "CHALLENGE_CONSUMED" ||
+        resendRes.code === "CHALLENGE_EXPIRED" ||
+        resendRes.code === "CHALLENGE_INVALID" ||
+        resendRes.code === "MAX_RESENDS_EXCEEDED"
+      ) {
+        clearAdminChallengeCookie(res);
+      }
+      return res.status(resendRes.httpStatus).json({
+        message: resendRes.message,
+        code: resendRes.code,
+        ...(resendRes.retryAfterSeconds
+          ? { retryAfterSeconds: resendRes.retryAfterSeconds }
+          : {}),
+      });
+    }
 
-// Helper — clears both cookies on all paths they may have been previously set under.
-const clearAuthCookies = (res: Response) => {
-  const isProd = env.NODE_ENV === "production";
-  const opts = { httpOnly: true, sameSite: (isProd ? "none" : "lax") as "none" | "lax", secure: isProd };
-  // Always clear the canonical root path.
-  res.clearCookie("jwt",          { ...opts, path: "/" });
-  res.clearCookie("refreshToken", { ...opts, path: "/" });
-  // Also clear any stale paths that may have been written by older deployments.
-  for (const stalePath of ["/api/auth/refresh", "/api/auth", "/api"]) {
-    res.clearCookie("jwt",          { ...opts, path: stalePath });
-    res.clearCookie("refreshToken", { ...opts, path: stalePath });
+    const rotatedChallengeCookie = signAdminLoginChallengeCookie({
+      challengeId: resendRes.challengeId,
+      userId: String(user._id),
+      email,
+      tokenVersionSnapshot: dbTokenVersion,
+    });
+
+    res.cookie(ADMIN_CHALLENGE_COOKIE_NAME, rotatedChallengeCookie, {
+      maxAge: 15 * 60 * 1000,
+      ...getAuthCookieOptions(),
+      path: "/",
+    });
+
+    return res.status(200).json({
+      message: "New verification code sent to your email.",
+      email,
+      challengeId: resendRes.challengeId,
+      expiresInSeconds: resendRes.expiresInSeconds,
+      resendAfterSeconds: resendRes.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("resendOtp error", err);
+    return res.status(500).json({
+      error: "Error occurred during resend",
+      details: err instanceof Error ? err.message : String(err),
+    });
   }
 };
 
 // POST /api/auth/logout
 export const logout = async (req: Request, res: Response) => {
-  // Always clear cookies first — user is logged out regardless of DB outcome.
   clearAuthCookies(res);
+  clearAdminChallengeCookie(res);
 
   try {
-    // Identify the user so we can revoke their refresh token in the DB.
-    // The route has no authMiddleware (to avoid a refresh-loop on forced logout),
-    // so we resolve the user id directly from the access token or refresh token cookies.
-    //   • Valid token   → jwt.verify succeeds → use decoded id
-    //   • Expired token → jwt.verify throws TokenExpiredError → jwt.decode gives us the id
-    //   • No / tampered → skip DB cleanup (cookies already cleared above)
+    // Only trust cryptographically verified JWT signatures (even when expired) so an
+    // unauthenticated attacker cannot force-increment tokenVersion for an arbitrary userId.
     let userId: string | undefined = req.user?.id;
 
     if (!userId) {
       const token = req.cookies?.jwt as string | undefined;
       if (token) {
         try {
-          const verified = jwt.verify(token, env.JWT_SECRET) as { id: string };
-          userId = verified.id;
+          const verified = jwt.verify(token, env.JWT_SECRET, {
+            ignoreExpiration: true,
+          }) as { id?: string };
+          if (typeof verified?.id === "string") userId = verified.id;
         } catch {
-          // Token expired or otherwise unverifiable — still extract the payload
-          // for DB cleanup only (no privilege is granted from this).
-          const decoded = jwt.decode(token) as { id?: string } | null;
-          userId = decoded?.id;
+          // Tampered/unverified JWT ignored
         }
       }
     }
 
-    // Layer 2 Fallback: Resolve userId from the refreshToken cookie itself
     if (!userId) {
       const refreshToken = req.cookies?.refreshToken as string | undefined;
       if (refreshToken) {
         try {
-          const verified = jwt.verify(refreshToken, env.REFRESH_TOKEN_SECRET) as { id: string };
-          userId = verified.id;
+          const verified = jwt.verify(refreshToken, env.REFRESH_TOKEN_SECRET, {
+            ignoreExpiration: true,
+          }) as { id?: string };
+          if (typeof verified?.id === "string") userId = verified.id;
         } catch {
-          const decoded = jwt.decode(refreshToken) as { id?: string } | null;
-          userId = decoded?.id;
+          // Tampered/unverified refreshToken ignored
         }
       }
     }
 
     if (userId) {
-      await User.findByIdAndUpdate(userId, {
-        refreshToken: null,
-        previousRefreshToken: null,
-        refreshTokenFamily: null,
-        lastRotatedAt: null,
-      });
+      await revokeUserSessions(req.app.get("socketio"), userId, "LOGOUT");
     }
 
     return res.status(200).json({ message: "Logout Successful" });
-  } catch (err: any) {
+  } catch (err: unknown) {
     logger.error("logout error", err);
-    // Don't expose internal errors — cookies are already cleared so the user
-    // is effectively logged out even if the DB update failed.
     return res.status(200).json({ message: "Logout Successful" });
   }
 };
 
 // POST /api/auth/refresh
 export const refreshTokens = async (req: Request, res: Response) => {
-  const refreshToken = req.cookies.refreshToken;
+  const refreshToken = req.cookies?.refreshToken as string | undefined;
   if (!refreshToken) {
     return res.status(401).json({ message: "Refresh token not provided." });
   }
 
   try {
     const decoded = jwt.verify(refreshToken, env.REFRESH_TOKEN_SECRET) as {
-      id: string;
-      tokenValue: string;
+      id?: string;
+      tokenValue?: string;
       family?: string;
+      tokenVersion?: unknown;
     };
 
-    const user = await User.findById(decoded.id);
+    if (
+      typeof decoded.id !== "string" ||
+      typeof decoded.tokenValue !== "string" ||
+      !decoded.tokenValue ||
+      typeof decoded.family !== "string" ||
+      !decoded.family
+    ) {
+      clearAuthCookies(res);
+      return res.status(401).json({ message: "Invalid refresh token payload." });
+    }
 
+    if (!hasValidTokenVersionClaim(decoded.tokenVersion)) {
+      clearAuthCookies(res);
+      return res.status(401).json({
+        message: "Session security upgrade requires re-authentication. Please log in again.",
+        code: "LEGACY_TOKEN",
+      });
+    }
+
+    const user = await User.findById(decoded.id);
     if (!user) {
       clearAuthCookies(res);
       return res.status(403).json({ message: "Invalid or revoked refresh token." });
     }
 
+    if (user.isActive === false) {
+      clearAuthCookies(res);
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact support.",
+      });
+    }
+
+    const dbTokenVersion = typeof user.tokenVersion === "number" ? user.tokenVersion : 0;
+    if (decoded.tokenVersion !== dbTokenVersion) {
+      clearAuthCookies(res);
+      return res.status(403).json({
+        message: "Your session has been revoked. Please log in again.",
+        code: "TOKEN_VERSION_MISMATCH",
+      });
+    }
+
     const now = Date.now();
-    const GRACE_WINDOW_MS = 15 * 60 * 1000; // 15-minute grace window for in-flight requests / multi-tab synchronization
+    const GRACE_WINDOW_MS = 15 * 60 * 1000;
+    const submittedDigest = hashRefreshTokenValue(decoded.tokenValue);
+    const isSameFamily = Boolean(user.refreshTokenFamily) && user.refreshTokenFamily === decoded.family;
 
-    const isCurrentToken = user.refreshToken === decoded.tokenValue;
+    const isCurrentToken =
+      isSameFamily &&
+      Boolean(user.refreshToken) &&
+      timingSafeEqualToken(user.refreshToken!, submittedDigest);
 
-    // Check recent rotated tokens array
     const recentTokens = user.previousRefreshTokens || [];
-    const isInRecentTokens = recentTokens.some(
-      (item) =>
-        item.token === decoded.tokenValue &&
-        now - new Date(item.rotatedAt).getTime() < GRACE_WINDOW_MS,
-    );
+    const isInRecentTokens =
+      isSameFamily &&
+      recentTokens.some(
+        (item) =>
+          item.token &&
+          timingSafeEqualToken(item.token, submittedDigest) &&
+          now - new Date(item.rotatedAt).getTime() < GRACE_WINDOW_MS,
+      );
 
-    // Fallback check for single legacy field
     const isLegacyGraceToken =
+      isSameFamily &&
       !!user.previousRefreshToken &&
-      user.previousRefreshToken === decoded.tokenValue &&
-      decoded.family === user.refreshTokenFamily &&
+      timingSafeEqualToken(user.previousRefreshToken, submittedDigest) &&
       !!user.lastRotatedAt &&
       now - new Date(user.lastRotatedAt).getTime() < GRACE_WINDOW_MS;
 
@@ -352,16 +1176,16 @@ export const refreshTokens = async (req: Request, res: Response) => {
       });
     }
 
-    // Strict Access Revocation Check for Staff
     if (user.role === "STAFF") {
       const staffProfile = await StaffProfile.findOne({ userId: user._id }).lean();
-
       if (!staffProfile || staffProfile.isActive === false) {
         clearAuthCookies(res);
-        logger.warn(`Refresh blocked: Deactivated staff member attempted token refresh`, { userId: user._id });
-        return res
-          .status(403)
-          .json({ message: "Your account has been deactivated. Please contact your administrator." });
+        logger.warn("Refresh blocked: Deactivated staff member attempted token refresh", {
+          userId: user._id,
+        });
+        return res.status(403).json({
+          message: "Your account has been deactivated. Please contact your administrator.",
+        });
       }
     }
 
@@ -370,33 +1194,41 @@ export const refreshTokens = async (req: Request, res: Response) => {
         id: user.id,
         email: user.email ?? "",
         role: user.role,
+        tokenVersion: dbTokenVersion,
       },
       res,
-      decoded.family, // keep rotating within the same session family
+      decoded.family,
     );
 
-    return res
-      .status(200)
-      .json({ message: "Access token refreshed successfully.", isLoggedIn: true, role: user.role });
+    return res.status(200).json({
+      message: "Access token refreshed successfully.",
+      isLoggedIn: true,
+      role: user.role,
+    });
   } catch {
     clearAuthCookies(res);
-    return res
-      .status(403)
-      .json({
-        message: "Invalid or expired refresh token. Please log in again.",
-      });
+    return res.status(403).json({
+      message: "Invalid or expired refresh token. Please log in again.",
+    });
   }
 };
 
-// ─── MSG91 Mobile OTP ─────────────────────────────────────────────────────────
-// The MSG91 Widget send/verify OTP calls must be made from the browser.
-// This server only calls verifyAccessToken — the one server-side allowed endpoint.
-const MSG91_AUTH_KEY = env.MSG91_AUTH_KEY;
+// ─── MSG91 Mobile OTP (Hardened Prep Window) ───────────────────────────────────
 
-/** Shared helper: verify a MSG91 widget access token server-side with 12s timeout. */
-const verifyMsg91Token = async (
+/** Verify a MSG91 widget access token server-side and extract its canonical verified phone. */
+export const verifyMsg91Token = async (
   accessToken: string,
-): Promise<{ ok: boolean; status?: number; body?: Record<string, unknown> }> => {
+): Promise<{
+  ok: boolean;
+  status?: number;
+  verifiedPhone?: string | null;
+  body?: Record<string, unknown>;
+}> => {
+  if (!env.MSG91_AUTH_KEY) {
+    logger.error("verifyMsg91Token: MSG91_AUTH_KEY is not configured");
+    return { ok: false, status: 500, verifiedPhone: null };
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 12000);
   try {
@@ -404,36 +1236,64 @@ const verifyMsg91Token = async (
       "https://control.msg91.com/api/v5/widget/verifyAccessToken",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ authkey: MSG91_AUTH_KEY, "access-token": accessToken }),
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ authkey: env.MSG91_AUTH_KEY, "access-token": accessToken }),
         signal: controller.signal,
       },
     );
     clearTimeout(timeoutId);
     const rawText = await resp.text();
     let body: Record<string, unknown> = {};
-    try { body = JSON.parse(rawText); } catch { body = { raw: rawText }; }
-    return { ok: resp.ok && body.type === "success", status: resp.status, body };
+    try {
+      body = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+    } catch {
+      body = { raw: rawText };
+    }
+
+    const typeSuccess = typeof body.type === "string" && body.type.toLowerCase() === "success";
+    const verifiedPhone = extractVerifiedPhoneFromMsg91(body);
+
+    if (!resp.ok || !typeSuccess) {
+      return { ok: false, status: resp.status, verifiedPhone: null, body };
+    }
+
+    // Fail closed if MSG91 returned success without a verifiable mobile identifier.
+    if (!verifiedPhone) {
+      logger.warn("verifyMsg91Token: MSG91 response missing verifiable mobile identifier", {
+        status: resp.status,
+      });
+      return { ok: false, status: 401, verifiedPhone: null, body };
+    }
+
+    return { ok: true, status: resp.status, verifiedPhone, body };
   } catch (err: unknown) {
     clearTimeout(timeoutId);
     const e = err as Error;
     if (e?.name === "AbortError" || controller.signal.aborted) {
       logger.error("verifyMsg91Token: timeout verifying token with MSG91 gateway");
-      return { ok: false, status: 504, body: { message: "MSG91 verification gateway timeout" } };
+      return {
+        ok: false,
+        status: 504,
+        verifiedPhone: null,
+        body: { message: "MSG91 verification gateway timeout" },
+      };
     }
     throw err;
   }
 };
 
 // POST /api/auth/mobile/login
-// OTP was already verified browser-side via MSG91 Widget.
-// Backend re-validates the access token, then logs in the existing customer.
-// Returns 404 if no account exists — frontend should guide user to sign up.
 export const mobileLogin = async (req: Request, res: Response) => {
   const { phone, accessToken } = req.body as { phone: string; accessToken: string };
+  const submittedPhone = normalizeUaeMobile(phone);
+  if (!submittedPhone) {
+    return res.status(400).json({ message: "Invalid mobile number format." });
+  }
 
   try {
-    logger.info("mobileLogin: verifying token", { phone: phone.trim() });
     let result: Awaited<ReturnType<typeof verifyMsg91Token>>;
     try {
       result = await verifyMsg91Token(accessToken);
@@ -443,13 +1303,25 @@ export const mobileLogin = async (req: Request, res: Response) => {
       return res.status(502).json({ message: "Could not verify OTP token. Please try again." });
     }
 
-    if (!result.ok) {
-      logger.error("mobileLogin: MSG91 rejected token", result);
-      return res.status(401).json({ message: "OTP verification failed. Please try again." });
+    if (!result.ok || !result.verifiedPhone) {
+      logger.warn("mobileLogin: MSG91 rejected token", { status: result.status });
+      return res.status(result.status === 504 ? 504 : 401).json({
+        message: "OTP verification failed. Please try again.",
+      });
     }
 
-    // Find the customer — must already exist
-    const user = await User.findOne({ phone: phone.trim() });
+    // Bind MSG91's verified phone number to req.body.phone.
+    if (!timingSafeEqualToken(result.verifiedPhone, submittedPhone)) {
+      logger.warn("mobileLogin: MSG91 token identifier mismatch against submitted phone", {
+        ip: req.ip,
+      });
+      return res.status(403).json({
+        message: "Verified mobile number does not match the submitted phone number.",
+        code: "PHONE_MISMATCH",
+      });
+    }
+
+    const user = await User.findOne({ phone: submittedPhone });
     if (!user) {
       return res.status(404).json({
         message: "No account found with this number. Please sign up first.",
@@ -457,7 +1329,34 @@ export const mobileLogin = async (req: Request, res: Response) => {
       });
     }
 
-    await generateToken({ id: user.id, email: user.email ?? "", role: user.role }, res);
+    if (user.role !== "CUSTOMER") {
+      logger.warn("mobileLogin: privileged/staff role blocked from customer SMS login", {
+        userId: user.id,
+        role: user.role,
+      });
+      return res.status(403).json({
+        message: "This account cannot be accessed via customer SMS login. Please use the Staff/Admin portal.",
+        code: "ROLE_RESTRICTED",
+      });
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact support.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    await generateToken(
+      {
+        id: user.id,
+        email: user.email ?? "",
+        role: user.role,
+        tokenVersion: user.tokenVersion ?? 0,
+      },
+      res,
+    );
+
     return res.status(200).json({
       message: "Login successful.",
       user: { id: user.id, username: user.username, role: user.role },
@@ -470,108 +1369,125 @@ export const mobileLogin = async (req: Request, res: Response) => {
 };
 
 // POST /api/auth/mobile/register
-// Register a new customer after their phone is verified via MSG91 Widget OTP.
-// Requires: name (required), email (optional), phone, accessToken.
 export const registerCustomer = async (req: Request, res: Response) => {
   const { name, email, phone, accessToken } = req.body as {
-    name: string;
-    email?: string;
-    phone: string;
-    accessToken: string;
+    name?: unknown;
+    email?: unknown;
+    phone?: unknown;
+    accessToken?: unknown;
   };
 
+  // Defense-in-depth backend re-validation of mandatory signup identity fields
+  const cleanName = typeof name === "string" ? name.trim() : "";
+  if (!cleanName || cleanName.length < 2 || cleanName.length > 80) {
+    return res.status(400).json({ message: "Valid full name (2-80 characters) is required." });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    return res.status(400).json({ message: "Valid email address is required." });
+  }
+
+  const submittedPhone = normalizeStrictUaePhone(phone);
+  if (!submittedPhone) {
+    return res.status(400).json({ message: "Invalid mobile number format." });
+  }
+
+  const cleanAccessToken = typeof accessToken === "string" ? accessToken.trim() : "";
+  if (!cleanAccessToken) {
+    return res.status(400).json({ message: "Access token is required." });
+  }
+
   try {
-    logger.info("registerCustomer: verifying token", { phone: phone.trim() });
     let result: Awaited<ReturnType<typeof verifyMsg91Token>>;
     try {
-      result = await verifyMsg91Token(accessToken);
+      result = await verifyMsg91Token(cleanAccessToken);
     } catch (fetchErr) {
       const e = fetchErr as Error;
       logger.error("registerCustomer verifyMsg91Token threw", { message: e?.message });
       return res.status(502).json({ message: "Could not verify OTP token. Please try again." });
     }
 
-    if (!result.ok) {
-      return res.status(401).json({ message: "OTP verification failed. Please try again." });
+    if (!result.ok || !result.verifiedPhone) {
+      return res.status(result.status === 504 ? 504 : 401).json({
+        message: "OTP verification failed. Please try again.",
+      });
     }
 
-    // Check for duplicate phone or email — specific per field
-    const phoneExists = await User.findOne({ phone: phone.trim() });
-    if (phoneExists) {
+    if (!timingSafeEqualToken(result.verifiedPhone, submittedPhone)) {
+      logger.warn("registerCustomer: MSG91 token identifier mismatch against submitted phone", {
+        ip: req.ip,
+      });
+      return res.status(403).json({
+        message: "Verified mobile number does not match the submitted phone number.",
+        code: "PHONE_MISMATCH",
+      });
+    }
+
+    const duplicateQuery: Array<Record<string, unknown>> = [
+      { phone: submittedPhone },
+      { email: normalizedEmail },
+      { email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } },
+    ];
+
+    const existing = await User.findOne({ $or: duplicateQuery }).select("_id").lean();
+    if (existing) {
       return res.status(409).json({
-        message: "An account with this phone number already exists. Please sign in.",
+        message: "An account already exists with these details. Please sign in or use different details.",
         code: "DUPLICATE",
       });
     }
-    if (email?.trim()) {
-      const emailExists = await User.findOne({ email: email.trim().toLowerCase() });
-      if (emailExists) {
-        return res.status(409).json({
-          message: "An account with this email address already exists. Please sign in with a different email.",
-          code: "DUPLICATE",
-        });
-      }
-    }
 
     const user = await User.create({
-      username: name.trim(),
-      email: email?.trim().toLowerCase() || null,
-      phone: phone.trim(),
+      username: cleanName,
+      email: normalizedEmail,
+      phone: submittedPhone,
       role: "CUSTOMER",
+      isVerified: true,
+      isActive: true,
+      tokenVersion: 0,
+      emailVerifiedAt: null,
     });
 
     await generateToken(
-      { id: user.id, email: user.email ?? "", role: user.role },
+      {
+        id: user.id,
+        email: user.email ?? "",
+        role: user.role,
+        tokenVersion: user.tokenVersion ?? 0,
+      },
       res,
     );
-    logger.info("registerCustomer: created user", { id: user.id });
+    logger.info("registerCustomer: created customer", { id: user.id });
     return res.status(201).json({
       message: "Account created successfully. Welcome!",
       user: { id: user.id, username: user.username, role: user.role },
     });
   } catch (err: unknown) {
-    const e = err as Error;
+    if (isDuplicateKeyError(err)) {
+      return res.status(409).json({
+        message: "An account already exists with these details. Please sign in or use different details.",
+        code: "DUPLICATE",
+      });
+    }
+    const e = err as { message?: string; stack?: string };
     logger.error("registerCustomer error", { message: e?.message, stack: e?.stack });
     return res.status(500).json({ message: "Server error." });
   }
 };
 
-// POST /api/auth/mobile/check-phone
-// Called before sending OTP on the Sign In screen.
-// Returns 200 if the phone is a registered CUSTOMER/STAFF, 403 if it belongs to
-// an admin/superadmin (who must use email/password login), 404 if not found.
-export const checkPhoneExists = async (req: Request, res: Response) => {
-  const { phone } = req.body as { phone: string };
-  try {
-    const user = await User.findOne({ phone: phone.trim() });
-    if (!user) {
-      return res.status(404).json({
-        message: "No account found with this number. Please sign up first.",
-        code: "NO_ACCOUNT",
-      });
-    }
-    // Block admin / superadmin from using the customer OTP flow
-    if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
-      return res.status(403).json({
-        message: "This account cannot be accessed via phone login. Please use the Admin Portal.",
-        code: "ADMIN_ROLE",
-      });
-    }
-    return res.status(200).json({ exists: true });
-  } catch (err: unknown) {
-    const e = err as Error;
-    logger.error("checkPhoneExists error", { message: e?.message });
-    return res.status(500).json({ message: "Server error." });
-  }
+// POST /api/auth/mobile/check-phone — Retired to prevent unauthenticated phone/role enumeration
+export const checkPhoneExists = async (_req: Request, res: Response) => {
+  return res.status(410).json({
+    message: "Phone pre-check has been retired. Proceed directly to OTP verification.",
+    code: "ENDPOINT_RETIRED",
+  });
 };
 
 // GET /api/auth/mobile/widget-config
-// Exposes client-side public MSG91 widget configuration to the browser
 export const getMsg91WidgetConfig = async (_req: Request, res: Response) => {
   return res.status(200).json({
     widgetId: env.MSG91_WIDGET_ID || "",
     tokenAuth: env.MSG91_TOKEN_AUTH || "",
   });
 };
-
-

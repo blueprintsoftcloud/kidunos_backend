@@ -9,6 +9,7 @@ declare global {
         id: string;
         email: string;
         role: "CUSTOMER" | "ADMIN" | "SUPER_ADMIN" | "STAFF";
+        tokenVersion: number;
       };
       /** Set by requestId.middleware.ts — correlates one request across all its log lines. */
       requestId?: string;

@@ -1,19 +1,17 @@
 // src/middleware/auth.middleware.ts
-// Verifies the JWT access token from the HttpOnly cookie.
-// Sets req.user = { id, email, role } on success.
-// Returns 401 on missing or invalid token, with an 'expired' flag for the frontend interceptor.
+// Verifies the JWT access token from the HttpOnly cookie against central session state.
+// Sets req.user = { id, email, role, tokenVersion } on success.
+// Returns 401 on missing, expired, legacy, or revoked tokens.
 
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { User, StaffProfile } from "../models/mongoose";
 import { env } from "../config/env";
+import { clearAuthCookies } from "../config/tokens";
+import {
+  validateActiveSessionUser,
+  type DecodedSessionClaims,
+} from "../services/session.service";
 import logger from "../utils/logger";
-
-interface JwtPayload {
-  id: string;
-  email: string;
-  role: "CUSTOMER" | "ADMIN" | "SUPER_ADMIN" | "STAFF";
-}
 
 export const authMiddleware = async (
   req: Request,
@@ -29,37 +27,29 @@ export const authMiddleware = async (
 
   try {
     // 1. Mathematically verify the JWT (Stateless check)
-    const decoded = jwt.verify(token, env.JWT_SECRET) as JwtPayload;
+    const decoded = jwt.verify(token, env.JWT_SECRET) as DecodedSessionClaims;
 
-    // 2. Strict Access Revocation (Stateful check for internal roles)
-    if (decoded.role === "STAFF") {
-      const staffProfile = await StaffProfile.findOne({ userId: decoded.id }).lean();
-      
-      // If profile is deleted OR explicitly marked inactive, kill the session
-      if (!staffProfile || staffProfile.isActive === false) {
-        logger.warn(`Auth blocked: Deactivated staff member attempted access`, { userId: decoded.id });
-        res.status(401).json({ 
-          message: "Your account has been deactivated. Please contact your administrator.",
-          expired: true // Tell FE to wipe cookies and redirect
-        });
-        return;
+    // 2. Centralized stateful validation (all roles: existence, isActive, tokenVersion,
+    //    email match, and StaffProfile.isActive for STAFF)
+    const validation = await validateActiveSessionUser(decoded);
+    if (!validation.valid) {
+      logger.warn("Auth blocked by centralized session validator", {
+        code: validation.code,
+        userId: typeof decoded?.id === "string" ? decoded.id : undefined,
+      });
+      if (validation.clearCookies && validation.code !== "LEGACY_TOKEN") {
+        clearAuthCookies(res);
       }
-    } 
-    else if (decoded.role === "ADMIN") {
-      // For Admins, we verify the user document still exists (in case of hard delete by Super Admin)
-      const userExists = await User.exists({ _id: decoded.id });
-      if (!userExists) {
-        logger.warn(`Auth blocked: Deleted admin attempted access`, { userId: decoded.id });
-        res.status(401).json({ 
-          message: "This account no longer exists.",
-          expired: true 
-        });
-        return;
-      }
+      res.status(401).json({
+        message: validation.message,
+        code: validation.code,
+        expired: true,
+      });
+      return;
     }
 
-    // 3. Success! Attach user to request and proceed
-    req.user = decoded;
+    // 3. Attach verified claims and proceed
+    req.user = validation.user;
     next();
   } catch (err: unknown) {
     const isExpired = err instanceof Error && err.name === "TokenExpiredError";
@@ -73,13 +63,13 @@ export const authMiddleware = async (
 };
 
 /**
- * Attaches req.user if a valid token is present in cookies,
- * but does not reject the request if token is missing or expired.
+ * Attaches req.user if a valid, active, versioned token is present in cookies,
+ * but never rejects the request when missing, expired, or revoked.
  */
 export const optionalAuthMiddleware = async (
   req: Request,
   _res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> => {
   const token = req.cookies?.jwt as string | undefined;
   if (!token) {
@@ -88,10 +78,15 @@ export const optionalAuthMiddleware = async (
   }
 
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as JwtPayload;
-    req.user = decoded;
+    const decoded = jwt.verify(token, env.JWT_SECRET) as DecodedSessionClaims;
+    const validation = await validateActiveSessionUser(decoded);
+    if (validation.valid) {
+      req.user = validation.user;
+    } else {
+      req.user = undefined;
+    }
   } catch {
-    // Ignore invalid/expired token for optional auth
+    req.user = undefined;
   }
   next();
 };

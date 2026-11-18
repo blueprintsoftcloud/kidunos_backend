@@ -9,7 +9,16 @@ export const profileData = async (req: Request, res: Response) => {
     const userId = req.user!.id;
     const adminData = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, username: true, email: true, role: true, avatar: true, phone: true },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        role: true,
+        avatar: true,
+        phone: true,
+        emailVerifiedAt: true,
+        posActivationRequired: true,
+      },
     });
     if (!adminData)
       return res.status(404).json({ message: "Admin profile not found" });

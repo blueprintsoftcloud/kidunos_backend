@@ -19,10 +19,11 @@ export const addressSchema = z.object({
     .trim(),
   zipCode: z
     .string({ required_error: "ZIP code is required" })
-    .min(3, "ZIP code too short")
     .max(20, "ZIP code too long")
-    .trim(),
-  country: z.string().max(100).trim().default("India"),
+    .trim()
+    .optional()
+    .default(""),
+  country: z.string().max(100).trim().default("United Arab Emirates"),
   landmark: z.string().max(200).trim().optional(),
   isDefault: z.boolean().optional().default(false),
   latitude: z.number().min(-90).max(90).optional(),

@@ -1,7 +1,7 @@
 // src/config/storage.ts
 //
 // Unified storage layer supporting:
-// 1. Cloudflare R2 (recommended: 10GB free, $0 egress, pay-as-you-go ~₹1.25/GB)
+// 1. Cloudflare R2 (recommended: 10GB free, $0 egress, low pay-as-you-go costs)
 // 2. Cloudinary (legacy support for existing deployments)
 //
 // Automatic WebP compression via sharp is applied before pushing to R2,
@@ -236,4 +236,3 @@ export default {
   optimizeImageBuffer,
   withAutoOptimization,
 };
-

@@ -15,6 +15,13 @@ const pct = (curr: number, prev: number) => {
 
 const sumOf = (facetBucket: Array<{ sum?: number }>) => facetBucket[0]?.sum ?? 0;
 const countOf = (facetBucket: Array<{ n?: number }>) => facetBucket[0]?.n ?? 0;
+const currencyFilter = (_req: Request): Record<string, unknown> => ({
+  currency: "AED",
+});
+
+const joinedCurrencyFilter = (_req: Request): Record<string, unknown> => ({
+  "order.currency": "AED",
+});
 
 const parseDateRange = (from?: string, to?: string) => ({
   fromDate: from ? new Date(from) : undefined,
@@ -34,6 +41,7 @@ export const getSummary = async (_req: Request, res: Response) => {
 
     const [[orderFacets], [userFacets], totalProducts] = await Promise.all([
       Order.aggregate([
+        { $match: currencyFilter(_req) },
         {
           $facet: {
             totalRevenue: [
@@ -115,7 +123,7 @@ export const getRevenueByDay = async (req: Request, res: Response) => {
     since.setDate(since.getDate() - days);
 
     const rows = await Order.aggregate([
-      { $match: { paymentStatus: "PAID", orderStatus: { $nin: ["CANCELLED", "RETURNED"] }, createdAt: { $gte: since } } },
+      { $match: { ...currencyFilter(req), paymentStatus: "PAID", orderStatus: { $nin: ["CANCELLED", "RETURNED"] }, createdAt: { $gte: since } } },
       {
         $group: {
           _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
@@ -155,7 +163,7 @@ export const getOrderStatusBreakdown = async (req: Request, res: Response) => {
     const dateMatch: Record<string, unknown> = {};
     if (fromDate) dateMatch.$gte = fromDate;
     if (toDate) dateMatch.$lte = toDate;
-    const match = fromDate || toDate ? { createdAt: dateMatch } : {};
+    const match = { ...currencyFilter(req), ...(fromDate || toDate ? { createdAt: dateMatch } : {}) };
 
     const rows = await Order.aggregate([{ $match: match }, { $group: { _id: "$orderStatus", count: { $sum: 1 } } }]);
     const countByStatus = new Map(rows.map((r) => [r._id as string, r.count as number]));
@@ -177,6 +185,9 @@ export const getTopProducts = async (req: Request, res: Response) => {
     const limit = Math.min(Math.max(parseInt((req.query.limit as string) ?? "5") || 5, 1), 20);
 
     const result = await OrderItem.aggregate([
+      { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
+      { $unwind: "$order" },
+      { $match: joinedCurrencyFilter(req) },
       {
         $group: {
           _id: "$productId",
@@ -224,14 +235,16 @@ export const getTopCategories = async (req: Request, res: Response) => {
     const orderDateMatch: Record<string, unknown> = {};
     if (fromDate) orderDateMatch.$gte = fromDate;
     if (toDate) orderDateMatch.$lte = toDate;
-    const dateStages =
-      fromDate || toDate
-        ? [
-            { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
-            { $unwind: "$order" },
-            { $match: { "order.createdAt": orderDateMatch } },
-          ]
-        : [];
+    const dateStages = [
+      { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
+      { $unwind: "$order" },
+      {
+        $match: {
+          ...joinedCurrencyFilter(req),
+          ...(fromDate || toDate ? { "order.createdAt": orderDateMatch } : {}),
+        },
+      },
+    ];
 
     const result = await OrderItem.aggregate([
       ...dateStages,
@@ -276,7 +289,7 @@ export const getProfitSummary = async (req: Request, res: Response) => {
     const dateMatch: Record<string, unknown> = {};
     if (fromDate) dateMatch.$gte = fromDate;
     if (toDate) dateMatch.$lte = toDate;
-    const orderMatch: Record<string, unknown> = { paymentStatus: "PAID" };
+    const orderMatch: Record<string, unknown> = { paymentStatus: "PAID", ...currencyFilter(req) };
     if (fromDate || toDate) orderMatch.createdAt = dateMatch;
 
     const costPipelineFor = (match: Record<string, unknown>) => [
@@ -334,7 +347,7 @@ export const getProfitSummary = async (req: Request, res: Response) => {
       const diffMs = toDate.getTime() - fromDate.getTime();
       const prevFrom = new Date(fromDate.getTime() - diffMs);
       const prevTo = new Date(fromDate.getTime() - 1);
-      const prevOrderMatch = { paymentStatus: "PAID", createdAt: { $gte: prevFrom, $lte: prevTo } };
+      const prevOrderMatch = { paymentStatus: "PAID", ...currencyFilter(req), createdAt: { $gte: prevFrom, $lte: prevTo } };
 
       const [prevRevenueAggArr, [prevCostAgg]] = await Promise.all([
         Order.aggregate([{ $match: prevOrderMatch }, { $group: { _id: null, sum: { $sum: "$finalAmount" } } }]),
@@ -377,7 +390,7 @@ export const getProfitByDay = async (req: Request, res: Response) => {
 
     const [revenueRows, costRows] = await Promise.all([
       Order.aggregate([
-        { $match: { paymentStatus: "PAID", createdAt: { $gte: fromDate, $lte: toDate } } },
+        { $match: { ...currencyFilter(req), paymentStatus: "PAID", createdAt: { $gte: fromDate, $lte: toDate } } },
         {
           $group: {
             _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
@@ -389,7 +402,7 @@ export const getProfitByDay = async (req: Request, res: Response) => {
       OrderItem.aggregate([
         { $lookup: { from: "orders", localField: "orderId", foreignField: "_id", as: "order" } },
         { $unwind: "$order" },
-        { $match: { "order.paymentStatus": "PAID", "order.createdAt": { $gte: fromDate, $lte: toDate } } },
+        { $match: { "order.paymentStatus": "PAID", ...joinedCurrencyFilter(req), "order.createdAt": { $gte: fromDate, $lte: toDate } } },
         { $lookup: { from: "products", localField: "productId", foreignField: "_id", as: "product" } },
         { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
         // Same "0 means unknown, not free" rule as getProfitSummary's costPipelineFor above.
@@ -446,7 +459,7 @@ export const getTopProductsByProfit = async (req: Request, res: Response) => {
     const orderDateMatch: Record<string, unknown> = {};
     if (fromDate) orderDateMatch.$gte = fromDate;
     if (toDate) orderDateMatch.$lte = toDate;
-    const orderMatch: Record<string, unknown> = { "order.paymentStatus": "PAID" };
+    const orderMatch: Record<string, unknown> = { "order.paymentStatus": "PAID", ...joinedCurrencyFilter(req) };
     if (fromDate || toDate) orderMatch["order.createdAt"] = orderDateMatch;
 
     const result = await OrderItem.aggregate([
@@ -539,7 +552,7 @@ export const getPaymentMethodBreakdown = async (req: Request, res: Response) => 
     const dateMatch: Record<string, unknown> = {};
     if (fromDate) dateMatch.$gte = fromDate;
     if (toDate) dateMatch.$lte = toDate;
-    const match = fromDate || toDate ? { createdAt: dateMatch } : {};
+    const match = { ...currencyFilter(req), ...(fromDate || toDate ? { createdAt: dateMatch } : {}) };
 
     const rows = await Order.aggregate([
       { $match: match },
@@ -588,6 +601,7 @@ export const getSummaryWithRange = async (req: Request, res: Response) => {
 
     const [[orderFacets], [userFacets], totalProducts] = await Promise.all([
       Order.aggregate([
+        { $match: currencyFilter(req) },
         {
           $facet: {
             totalRevenue: [
@@ -657,7 +671,7 @@ export const getCustomerInsights = async (req: Request, res: Response) => {
     const dateMatch: Record<string, unknown> = {};
     if (fromDate) dateMatch.$gte = fromDate;
     if (toDate) dateMatch.$lte = toDate;
-    const currentMatch: Record<string, unknown> = { paymentStatus: "PAID", ...(Object.keys(dateMatch).length ? { createdAt: dateMatch } : {}) };
+    const currentMatch: Record<string, unknown> = { paymentStatus: "PAID", ...currencyFilter(req), ...(Object.keys(dateMatch).length ? { createdAt: dateMatch } : {}) };
 
     const perCustomer = await Order.aggregate([
       { $match: currentMatch },
@@ -669,7 +683,7 @@ export const getCustomerInsights = async (req: Request, res: Response) => {
                 from: "orders",
                 let: { uid: "$_id" },
                 pipeline: [
-                  { $match: { $expr: { $and: [{ $eq: ["$userId", "$$uid"] }, { $eq: ["$paymentStatus", "PAID"] }, { $lt: ["$createdAt", fromDate] }] } } },
+                  { $match: { $expr: { $and: [{ $eq: ["$userId", "$$uid"] }, { $eq: ["$paymentStatus", "PAID"] }, { $lt: ["$createdAt", fromDate] }] }, currency: "AED" } },
                   { $count: "n" },
                 ],
                 as: "priorOrders",
@@ -712,7 +726,7 @@ export const getSalesByLocation = async (req: Request, res: Response) => {
     const dateMatch: Record<string, unknown> = {};
     if (fromDate) dateMatch.$gte = fromDate;
     if (toDate) dateMatch.$lte = toDate;
-    const match: Record<string, unknown> = { paymentStatus: "PAID", ...(Object.keys(dateMatch).length ? { createdAt: dateMatch } : {}) };
+    const match: Record<string, unknown> = { paymentStatus: "PAID", ...currencyFilter(req), ...(Object.keys(dateMatch).length ? { createdAt: dateMatch } : {}) };
 
     const result = await Order.aggregate([
       { $match: match },
@@ -747,6 +761,7 @@ export const getCouponPerformance = async (req: Request, res: Response) => {
     if (toDate) dateMatch.$lte = toDate;
     const match: Record<string, unknown> = {
       paymentStatus: "PAID",
+      ...currencyFilter(req),
       couponId: { $ne: null },
       ...(Object.keys(dateMatch).length ? { createdAt: dateMatch } : {}),
     };

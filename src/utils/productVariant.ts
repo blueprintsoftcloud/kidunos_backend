@@ -49,7 +49,7 @@ export function computeOptionsKey(options: Record<string, string>): string {
  * new Product.purchasePrice/discount too — so the top-level Margin/Discount figures
  * stay a coherent pair with the "starting from" price they're computed against, instead
  * of comparing a cost or promotion meant for a different option entirely. Unlike stock,
- * zero active variants does NOT zero these out (a card reading "₹0" looks like a
+ * zero active variants does NOT zero these out (a card reading "AED 0" looks like a
  * giveaway, not "unavailable") — they're left at their last values instead, same as
  * when there are no variants at all.
  *
@@ -221,9 +221,9 @@ export type ListingSort = "price-asc" | "price-desc" | "newest" | "rating" | "po
 
 /**
  * Applies price/on-sale filtering, sort, and pagination AFTER variant expansion —
- * has to run post-expansion because a filter like "under ₹500" or "on sale" is only
+ * has to run post-expansion because a filter like "under AED 500" or "on sale" is only
  * meaningful against each row's own effective price/discount, not the product's
- * synced-from-cheapest-variant summary (a product could have one variant under ₹500
+ * synced-from-cheapest-variant summary (a product could have one variant under AED 500
  * and another well above it). `Array.prototype.sort` is stable (ES2019+), so the
  * "no sort key matched" case leaves the DB's own ORDER BY intact rather than
  * reshuffling rows.

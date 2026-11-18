@@ -2,7 +2,11 @@ import { Request, Response } from "express";
 import crypto from "crypto";
 import mongoose from "mongoose";
 import { User, Order, Cart, Product, PaymentLog, StaffProfile, Role, OrderStatus, NotificationType, Address, OrderItem } from "../models/mongoose";
-import razorpay from "../config/razorpay";
+import {
+  createNomodCheckout,
+  getNomodCheckout,
+  getNomodCustomerName,
+} from "../services/nomod.service";
 import { calculateShippingWithConfig } from "../services/shipping.service";
 import { env } from "../config/env";
 import logger from "../utils/logger";
@@ -15,6 +19,15 @@ import { sendNotification } from "../services/notification.service";
 import { restoreStock, checkLowStock } from "../services/inventory.service";
 import { syncProductFromVariants } from "../utils/productVariant";
 import { uploadToCloudinary } from "../config/cloudinary";
+import { escapeRegex, normalizeEmail, normalizeUaeMobile } from "../utils/identity";
+import { normalizeUaeEmirate } from "../utils/uae";
+import {
+  ensureOtpCollectionsInitialized,
+  issueChallengeAndEnqueueOutbox,
+  resendChallengeAndEnqueueOutbox,
+  TxAbortError,
+  verifyChallengeOtp,
+} from "../services/otp.service";
 
 // ── Notification Helper ───────────────────────────────────────────────────────
 /**
@@ -38,6 +51,8 @@ const notifyUsers = async (
     }
   }
 };
+
+const formatOrderAmount = (amount: number, _currency?: string) => `AED ${amount}`;
 
 // ── Stock Helper ───────────────────────────────────────────────────────────────
 // Deduction stays synchronous/inline — it's the atomic "reject the order if stock
@@ -166,24 +181,22 @@ export const placeOrder = async (req: Request, res: Response) => {
     const address = await prisma.address.findFirst({
       where: { userId, isDefault: true },
     });
+    const checkoutAddress = incomingAddress?.fullAddress ? incomingAddress : address;
 
     if (!cart || cart.items.length === 0)
       return res.status(400).json({ message: "Cart is empty" });
-    if (!address)
+    if (!checkoutAddress)
       return res.status(400).json({ message: "Delivery address missing" });
 
-    // When Buy Now is used, only process the specified product and variant
     const eligibleItems = buyNowProductId
       ? cart.items.filter((i: any) =>
           i.product.id === buyNowProductId &&
           (!buyNowVariantId || i.variantId === buyNowVariantId),
         )
       : cart.items;
-
     if (eligibleItems.length === 0)
       return res.status(400).json({ message: "Product not found in cart" });
 
-    // Build order items + subtotal
     let subtotal = 0;
     const orderItems = eligibleItems.map((item: any) => {
       const price = itemPrice(item);
@@ -196,13 +209,15 @@ export const placeOrder = async (req: Request, res: Response) => {
       };
     });
 
-    // Recalculate shipping server-side (security: never trust client)
-    // If WAREHOUSE_SETTINGS feature is disabled by Super Admin → free shipping.
-    // There's no standalone FeatureFlag model (see review.controller.ts's
-    // isReviewsEnabled for the full explanation) — this used to call
-    // prisma.featureFlag.findUnique(...), which threw on every checkout. Reads from
-    // the generic AppSetting store instead, same as every other admin-togglable
-    // setting in this app.
+    const checkoutCountry = (checkoutAddress.country || "").trim().toLowerCase();
+    if (
+      checkoutCountry !== "united arab emirates" ||
+      !checkoutAddress.city?.trim() ||
+      !normalizeUaeEmirate(checkoutAddress.state || "")
+    ) {
+      return res.status(400).json({ message: "Please provide a valid UAE delivery address before checkout." });
+    }
+
     const warehouseFlag = await prisma.appSetting.findUnique({ where: { key: "WAREHOUSE_SETTINGS_ENABLED" } });
     const warehouseFeatureEnabled = !warehouseFlag || (warehouseFlag.value !== false && warehouseFlag.value !== "false");
     let shippingCharge: number;
@@ -212,12 +227,12 @@ export const placeOrder = async (req: Request, res: Response) => {
         shippingCharge = 0; // Shipping calculation disabled for Online Payments → Free
       } else {
         shippingCharge = (await calculateShippingWithConfig(
-          address.latitude ?? 0,
-          address.longitude ?? 0,
-          address.country,
-          address.state,
-          address.city ?? "",
-          address.zipCode ?? "",
+          checkoutAddress.latitude ?? checkoutAddress.lat ?? 0,
+          checkoutAddress.longitude ?? checkoutAddress.lng ?? 0,
+          "United Arab Emirates",
+          checkoutAddress.state,
+          checkoutAddress.city,
+          checkoutAddress.zipCode ?? "",
           shippingConfig,
           warehouse.lat,
           warehouse.lng,
@@ -242,37 +257,19 @@ export const placeOrder = async (req: Request, res: Response) => {
     }
 
     const finalAmount = Math.max(subtotal + shippingCharge - discountAmount, 0);
+    if (finalAmount <= 0) {
+      return res.status(400).json({ message: "No payment is due for this order. Choose another checkout method." });
+    }
 
-    // Create Razorpay order
-    const rzpOrder = await razorpay.orders.create({
-      amount: Math.round(finalAmount * 100), // paise
-      currency: "INR",
-      receipt: `receipt_${Date.now()}`,
-    });
-
-    // Order + coupon usage + stock deduction + payment log succeed or fail together —
-    // a partial write here (e.g. order created but stock not deducted) would sell stock
-    // that was never actually reserved. Razorpay order creation happens before the
-    // transaction because it's an external, non-transactional side effect: if the DB
-    // transaction below fails, the Razorpay order is simply never referenced by any
-    // persisted Order (a harmless orphan on Razorpay's side, not a data-integrity issue).
     const order = await prisma.$transaction(async (tx: typeof prisma) => {
-      const finalShippingAddress = incomingAddress?.fullAddress ? {
-        fullAddress: incomingAddress.fullAddress,
-        city: incomingAddress.city || address.city,
-        state: incomingAddress.state || address.state,
-        zipCode: incomingAddress.zipCode || address.zipCode,
-        country: incomingAddress.country || address.country || "India",
-        lat: typeof incomingAddress.lat === "number" ? incomingAddress.lat : (address.latitude ?? undefined),
-        lng: typeof incomingAddress.lng === "number" ? incomingAddress.lng : (address.longitude ?? undefined),
-      } : {
-        fullAddress: address.fullAddress,
-        city: address.city,
-        state: address.state,
-        zipCode: address.zipCode,
-        country: address.country,
-        lat: address.latitude ?? undefined,
-        lng: address.longitude ?? undefined,
+      const finalShippingAddress = {
+        fullAddress: checkoutAddress.fullAddress,
+        city: checkoutAddress.city,
+        state: normalizeUaeEmirate(checkoutAddress.state)!,
+        zipCode: checkoutAddress.zipCode || "",
+        country: "United Arab Emirates",
+        lat: checkoutAddress.lat ?? checkoutAddress.latitude ?? undefined,
+        lng: checkoutAddress.lng ?? checkoutAddress.longitude ?? undefined,
       };
 
       const created = await tx.order.create({
@@ -283,10 +280,10 @@ export const placeOrder = async (req: Request, res: Response) => {
           discountAmount,
           taxAmount: 0,
           finalAmount,
+          currency: "AED",
           paymentMethod: "ONLINE",
           paymentStatus: "PENDING",
           orderStatus: "PROCESSING",
-          razorpayOrderId: rzpOrder.id,
           couponId: resolvedCouponId,
           shippingAddress: finalShippingAddress,
           items: { create: orderItems },
@@ -299,25 +296,100 @@ export const placeOrder = async (req: Request, res: Response) => {
 
       await deductStock(orderItems, tx);
 
-      await tx.paymentLog.create({
-        data: {
-          orderId: created.id,
-          userId,
-          event: "ORDER_CREATED",
-          razorpayOrderId: rzpOrder.id,
-          paymentMethod: "ONLINE",
-          paymentStatus: "PENDING",
-          amount: finalAmount,
-          gatewayResponse: { razorpayOrderId: rzpOrder.id, currency: rzpOrder.currency, receipt: rzpOrder.receipt },
-          signatureValid: null,
-          ipAddress: req.ip ?? null,
-        },
-      });
-
       return created;
     });
 
-    res.status(200).json({ order, rzpOrder, razorpay_key_id: env.RAZORPAY_KEY_ID });
+    try {
+      const customer = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { username: true, email: true, phone: true },
+      });
+      const customerName = getNomodCustomerName(customer?.username);
+      const items = eligibleItems.map((item: any) => ({
+        item_id: `${item.product.id}${item.variantId ? `-${item.variantId}` : ""}`,
+        name: item.product.name,
+        quantity: item.quantity,
+        unit_amount: itemPrice(item).toFixed(2),
+      }));
+      if (shippingCharge > 0) {
+        items.push({
+          item_id: "uae-shipping",
+          name: "UAE delivery",
+          quantity: 1,
+          unit_amount: shippingCharge.toFixed(2),
+        });
+      }
+
+      const successUrl = new URL("/order-success", env.STOREFRONT_URL);
+      successUrl.searchParams.set("provider", "nomod");
+      successUrl.searchParams.set("orderId", order.id);
+      const failureUrl = new URL(successUrl);
+      failureUrl.searchParams.set("result", "failure");
+      const cancelledUrl = new URL(successUrl);
+      cancelledUrl.searchParams.set("result", "cancelled");
+      const phone = customer?.phone?.replace(/\D/g, "").replace(/^971/, "").replace(/^0/, "");
+
+      const session = await createNomodCheckout({
+        reference_id: order.id,
+        amount: finalAmount.toFixed(2),
+        currency: "AED",
+        items,
+        ...(discountAmount > 0 ? { discount: discountAmount.toFixed(2) } : {}),
+        customer: {
+          ...customerName,
+          ...(customer?.email ? { email: customer.email } : {}),
+          ...(phone ? { phone_number: `+971${phone}` } : {}),
+        },
+        success_url: successUrl.toString(),
+        failure_url: failureUrl.toString(),
+        cancelled_url: cancelledUrl.toString(),
+        metadata: { order_id: order.id },
+      });
+      const checkoutUrl = new URL(session.url);
+      if (checkoutUrl.protocol !== "https:" || !session.id) {
+        throw new Error("Nomod returned an invalid checkout session");
+      }
+
+      await prisma.$transaction(async (tx: typeof prisma) => {
+        await tx.order.update({
+          where: { id: order.id },
+          data: { nomodCheckoutId: session.id },
+        });
+        await tx.paymentLog.create({
+          data: {
+            orderId: order.id,
+            userId,
+            event: "ORDER_CREATED",
+            paymentMethod: "ONLINE",
+            paymentStatus: "PENDING",
+            amount: finalAmount,
+            currency: "AED",
+            transactionId: session.id,
+            gatewayResponse: { provider: "NOMOD", checkoutId: session.id },
+            signatureValid: null,
+            ipAddress: req.ip ?? null,
+          },
+        });
+      });
+
+      res.status(200).json({ order: { ...order, nomodCheckoutId: session.id }, checkoutUrl: session.url });
+    } catch (nomodError) {
+      logger.error("Nomod checkout creation failed", nomodError);
+      const cancelled = await prisma.order.updateMany({
+        where: { id: order.id, paymentStatus: "PENDING", orderStatus: "PROCESSING" },
+        data: { paymentStatus: "FAILED", orderStatus: "CANCELLED" },
+      });
+      if (cancelled.count > 0) {
+        await restoreStock({ orderId: order.id, items: orderItems });
+      }
+      const message =
+        nomodError instanceof Error
+          ? nomodError.message
+          : "Unknown Nomod checkout error";
+      return res.status(502).json({
+        message: `Unable to start online payment: ${message}`,
+      });
+    }
   } catch (err: any) {
     logger.error("placeOrder error", err);
     res
@@ -326,7 +398,175 @@ export const placeOrder = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/orders/verify  (authenticated)
+// POST /api/orders/nomod/verify  (authenticated)
+export const verifyNomodPayment = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { orderId } = req.body as { orderId: string };
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { items: true },
+    });
+
+    if (!order) return res.status(404).json({ message: "Order not found" });
+    if (String(order.userId) !== String(userId)) {
+      return res.status(403).json({ message: "You cannot verify this order" });
+    }
+    if (order.paymentStatus === "PAID") {
+      return res.status(200).json({ paymentStatus: "PAID", orderId: order.id });
+    }
+    if (!order.nomodCheckoutId) {
+      return res.status(400).json({ message: "Nomod checkout session is not associated with this order" });
+    }
+
+    const session = await getNomodCheckout(order.nomodCheckoutId);
+    const amountInCents = Math.round(Number(session.amount) * 100);
+    if (
+      session.id !== order.nomodCheckoutId ||
+      session.reference_id !== order.id ||
+      session.currency !== "AED" ||
+      amountInCents !== Math.round(order.finalAmount * 100)
+    ) {
+      logger.error(`Nomod checkout verification mismatch for order ${order.id}`);
+      return res.status(502).json({ message: "Payment details could not be verified. Please contact support." });
+    }
+
+    const gatewayStatus = typeof session.status === "string"
+      ? session.status.toLowerCase()
+      : String(session.status?.status || "").toLowerCase();
+
+    if (gatewayStatus === "paid") {
+      const transactionId = session.charges?.find((charge) => charge.id)?.id || session.id;
+      const updated = await prisma.$transaction(async (tx: typeof prisma) => {
+        const orderUpdate = await tx.order.updateMany({
+          where: { id: order.id, paymentStatus: { not: "PAID" } },
+          data: {
+            paymentStatus: "PAID",
+            orderStatus: "CONFIRMED",
+            transactionId,
+          },
+        });
+        if (orderUpdate.count === 0) return false;
+
+        await tx.paymentLog.create({
+          data: {
+            orderId: order.id,
+            userId,
+            event: "PAYMENT_SUCCESS",
+            paymentMethod: "ONLINE",
+            paymentStatus: "PAID",
+            amount: order.finalAmount,
+            currency: "AED",
+            transactionId,
+            gatewayResponse: {
+              provider: "NOMOD",
+              checkoutId: session.id,
+              status: gatewayStatus,
+              charges: session.charges,
+            },
+            signatureValid: null,
+            ipAddress: req.ip ?? null,
+          },
+        });
+
+        const purchasedItems = (order.items || []).map((item: any) => ({
+          productId: item.productId,
+          variantId: item.variantId ?? null,
+        }));
+        if (purchasedItems.length > 0) {
+          await tx.cartItem.deleteMany({
+            where: {
+              cart: { userId },
+              OR: purchasedItems,
+            },
+          });
+        }
+        return true;
+      });
+
+      if (!updated) {
+        return res.status(200).json({ paymentStatus: "PAID", orderId: order.id });
+      }
+
+      res.status(200).json({ paymentStatus: "PAID", orderId: order.id });
+      void (async () => {
+        try {
+          const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { username: true, email: true },
+          });
+          const shortId = order.id.slice(-6);
+          const adminIds = await getAdminRecipients();
+          const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
+          await notifyUsers(req, order.id, `New Order from ${user?.username || "Customer"}: ${formatOrderAmount(order.finalAmount, order.currency)}`, "NEW_ORDER", userId, orderRecipients);
+          await notifyUsers(req, order.id, `Payment Confirmed: Order #${shortId}`, "PAYMENT_SUCCESS", userId, adminIds);
+          await notifyUsers(req, order.id, `Payment confirmed for order #${shortId}`, "PAYMENT_SUCCESS", userId, [userId]);
+
+          if (user?.email) {
+            await sendEmail({
+              to: user.email,
+              toName: user.username,
+              ...orderConfirmationEmailPayload(shortId, user.username, order.finalAmount.toFixed(2), "ONLINE", "AED"),
+            });
+          }
+        } catch (sideEffectError) {
+          logger.error("Nomod payment post-response notification/email error", sideEffectError);
+        }
+      })();
+      return;
+    }
+
+    if (gatewayStatus === "cancelled" || gatewayStatus === "expired") {
+      const cancelled = await prisma.$transaction(async (tx: typeof prisma) => {
+        const updatedOrder = await tx.order.updateMany({
+          where: { id: order.id, paymentStatus: { not: "PAID" }, orderStatus: { not: "CANCELLED" } },
+          data: { paymentStatus: "FAILED", orderStatus: "CANCELLED" },
+        });
+        if (updatedOrder.count === 0) return false;
+        await tx.paymentLog.create({
+          data: {
+            orderId: order.id,
+            userId,
+            event: "PAYMENT_FAILED",
+            paymentMethod: "ONLINE",
+            paymentStatus: "FAILED",
+            amount: order.finalAmount,
+            currency: "AED",
+            transactionId: session.id,
+            gatewayResponse: { provider: "NOMOD", checkoutId: session.id, status: gatewayStatus },
+            signatureValid: null,
+            ipAddress: req.ip ?? null,
+          },
+        });
+        if (order.couponId) {
+          await tx.coupon.updateMany({
+            where: { id: order.couponId, usedCount: { gt: 0 } },
+            data: { usedCount: { decrement: 1 } },
+          });
+        }
+        return true;
+      });
+      if (cancelled) {
+        await restoreStock({
+          orderId: order.id,
+          items: (order.items || []).map((item: any) => ({
+            productId: item.productId,
+            variantId: item.variantId ?? null,
+            quantity: item.quantity,
+          })),
+        });
+      }
+      return res.status(200).json({ paymentStatus: "FAILED", orderId: order.id });
+    }
+
+    return res.status(200).json({ paymentStatus: "PENDING", gatewayStatus });
+  } catch (err) {
+    logger.error("verifyNomodPayment error", err);
+    return res.status(502).json({ message: "Unable to verify payment with Nomod right now." });
+  }
+};
+
+// POST /api/orders/verify  (authenticated, legacy Razorpay in-flight orders only)
 export const verifyPayment = async (req: Request, res: Response) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, buyNowProductId, buyNowVariantId } =
@@ -435,7 +675,7 @@ export const verifyPayment = async (req: Request, res: Response) => {
           });
           const adminIds = await getAdminRecipients();
           const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
-          await notifyUsers(req, order.id, `New Order from ${user!.username}: ₹${order.finalAmount}`, "NEW_ORDER", userId, orderRecipients);
+          await notifyUsers(req, order.id, `New Order from ${user!.username}: ${formatOrderAmount(order.finalAmount, order.currency)}`, "NEW_ORDER", userId, orderRecipients);
           await notifyUsers(req, order.id, `Payment Confirmed: Order #${shortId} by ${user!.username}`, "PAYMENT_SUCCESS", userId, adminIds);
           await notifyUsers(req, order.id, `Success! Payment confirmed for order #${shortId}`, "PAYMENT_SUCCESS", userId, [userId]);
 
@@ -506,17 +746,23 @@ export const handleRazorpayWebhook = async (req: Request, res: Response) => {
     }
 
     const webhookSecret = env.RAZORPAY_WEBHOOK_SECRET || env.RAZORPAY_KEY_SECRET;
-    const rawPayload = (req as any).rawBody || JSON.stringify(req.body);
+    const rawBodyBuf = (req as { rawBody?: unknown }).rawBody;
+    if (!Buffer.isBuffer(rawBodyBuf)) {
+      logger.warn("[Razorpay Webhook] Missing raw request body buffer for HMAC verification");
+      return res.status(400).json({ message: "Missing raw webhook payload" });
+    }
 
     const expectedSignature = crypto
       .createHmac("sha256", webhookSecret)
-      .update(rawPayload)
+      .update(rawBodyBuf)
       .digest("hex");
 
+    const sigBuf = typeof signature === "string" ? Buffer.from(signature, "utf8") : Buffer.alloc(0);
+    const expectedBuf = Buffer.from(expectedSignature, "utf8");
     const isMatch =
-      typeof signature === "string" &&
-      signature.length === expectedSignature.length &&
-      crypto.timingSafeEqual(Buffer.from(signature, "utf-8"), Buffer.from(expectedSignature, "utf-8"));
+      sigBuf.length > 0 &&
+      sigBuf.length === expectedBuf.length &&
+      crypto.timingSafeEqual(sigBuf, expectedBuf);
 
     if (!isMatch) {
       logger.warn("[Razorpay Webhook] Signature verification failed");
@@ -603,7 +849,7 @@ export const handleRazorpayWebhook = async (req: Request, res: Response) => {
             });
             const adminIds = await getAdminRecipients();
             const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
-            await notifyUsers(req, order.id, `New Order from ${user?.username || "Customer"}: ₹${order.finalAmount}`, "NEW_ORDER", order.userId, orderRecipients);
+            await notifyUsers(req, order.id, `New Order from ${user?.username || "Customer"}: ${formatOrderAmount(order.finalAmount, order.currency)}`, "NEW_ORDER", order.userId, orderRecipients);
             await notifyUsers(req, order.id, `Payment Confirmed: Order #${shortId} by ${user?.username || "Customer"}`, "PAYMENT_SUCCESS", order.userId, adminIds);
             await notifyUsers(req, order.id, `Success! Payment confirmed for order #${shortId}`, "PAYMENT_SUCCESS", order.userId, [order.userId]);
 
@@ -722,21 +968,21 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
     const address = await prisma.address.findFirst({
       where: { userId, isDefault: true },
     });
+    const checkoutAddress = incomingAddress?.fullAddress ? incomingAddress : address;
 
     if (!cart || cart.items.length === 0)
       return res.status(400).json({ message: "Cart is empty" });
-    if (!address)
+    if (!checkoutAddress)
       return res.status(400).json({ message: "Delivery address missing" });
 
-    if (address.country !== "India") {
-      return res
-        .status(400)
-        .json({
-          message: "Pay on Delivery is not available for international orders.",
-        });
+    if (
+      (checkoutAddress.country || "").trim().toLowerCase() !== "united arab emirates" ||
+      !checkoutAddress.city?.trim() ||
+      !normalizeUaeEmirate(checkoutAddress.state || "")
+    ) {
+      return res.status(400).json({ message: "Please provide a valid UAE delivery address before checkout." });
     }
 
-    // When Buy Now is used, only process the specified product and variant
     const eligibleItems = buyNowProductId
       ? cart.items.filter((i: any) =>
           i.product.id === buyNowProductId &&
@@ -770,12 +1016,12 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
         shippingCharge = 0; // Shipping calculation disabled for Cash on Delivery → Free
       } else {
         shippingCharge = (await calculateShippingWithConfig(
-          address.latitude ?? 0,
-          address.longitude ?? 0,
-          address.country,
-          address.state,
-          address.city ?? "",
-          address.zipCode ?? "",
+          checkoutAddress.latitude ?? checkoutAddress.lat ?? 0,
+          checkoutAddress.longitude ?? checkoutAddress.lng ?? 0,
+          "United Arab Emirates",
+          checkoutAddress.state,
+          checkoutAddress.city,
+          checkoutAddress.zipCode ?? "",
           shippingConfig,
           warehouse.lat,
           warehouse.lng,
@@ -804,22 +1050,14 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
     // Order + coupon usage + stock deduction + cart clear + payment log all succeed or
     // fail together (see placeOrder above for why).
     const order = await prisma.$transaction(async (tx: typeof prisma) => {
-      const finalShippingAddress = incomingAddress?.fullAddress ? {
-        fullAddress: incomingAddress.fullAddress,
-        city: incomingAddress.city || address.city,
-        state: incomingAddress.state || address.state,
-        zipCode: incomingAddress.zipCode || address.zipCode,
-        country: incomingAddress.country || address.country || "India",
-        lat: typeof incomingAddress.lat === "number" ? incomingAddress.lat : (address.latitude ?? undefined),
-        lng: typeof incomingAddress.lng === "number" ? incomingAddress.lng : (address.longitude ?? undefined),
-      } : {
-        fullAddress: address.fullAddress,
-        city: address.city,
-        state: address.state,
-        zipCode: address.zipCode,
-        country: address.country,
-        lat: address.latitude ?? undefined,
-        lng: address.longitude ?? undefined,
+      const finalShippingAddress = {
+        fullAddress: checkoutAddress.fullAddress,
+        city: checkoutAddress.city,
+        state: normalizeUaeEmirate(checkoutAddress.state)!,
+        zipCode: checkoutAddress.zipCode || "",
+        country: "United Arab Emirates",
+        lat: checkoutAddress.lat ?? checkoutAddress.latitude ?? undefined,
+        lng: checkoutAddress.lng ?? checkoutAddress.longitude ?? undefined,
       };
 
       const created = await tx.order.create({
@@ -830,6 +1068,7 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
           discountAmount,
           taxAmount: 0,
           finalAmount,
+          currency: "AED",
           paymentMethod: "POD",
           paymentStatus: "PENDING",
           orderStatus: "CONFIRMED",
@@ -866,6 +1105,7 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
           paymentMethod: "POD",
           paymentStatus: "PENDING",
           amount: finalAmount,
+          currency: "AED",
           signatureValid: null,
           gatewayResponse: { note: "Pay on Delivery — no gateway transaction" },
           ipAddress: req.ip ?? null,
@@ -888,7 +1128,7 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
         });
         const shortId = order.id.slice(-6);
         const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
-        await notifyUsers(req, order.id, `New POD Order from ${user!.username}: ₹${finalAmount}`, "NEW_ORDER", userId, orderRecipients);
+        await notifyUsers(req, order.id, `New POD Order from ${user!.username}: AED ${finalAmount}`, "NEW_ORDER", userId, orderRecipients);
         await notifyUsers(req, order.id, `Your POD order #${shortId} has been confirmed! Pay on delivery.`, "NEW_ORDER", userId, [userId]);
 
         if (user?.email) {
@@ -896,7 +1136,7 @@ export const placeOrderPOD = async (req: Request, res: Response) => {
             await sendEmail({
               to: user.email,
               toName: user.username,
-              ...orderConfirmationEmailPayload(shortId, user.username, finalAmount.toFixed(2), "POD"),
+              ...orderConfirmationEmailPayload(shortId, user.username, finalAmount.toFixed(2), "POD", "AED"),
             });
             logger.info(`POD order confirmation email sent for ${user.email}`);
           } catch (emailErr) {
@@ -1008,8 +1248,8 @@ export const placeOrderQR = async (req: Request, res: Response) => {
     let shippingCharge: number;
     if (warehouseFeatureEnabledQR) {
       const [warehouse, shippingConfig] = await Promise.all([getWarehouseCoords(), getShippingConfigFromDB()]);
-      if (shippingConfig.calculateShippingForQR === false) {
-        shippingCharge = 0; // Shipping calculation disabled for QR Payments → Free
+      if (shippingConfig.calculateShippingForOnline === false) {
+        shippingCharge = 0;
       } else {
         shippingCharge = (await calculateShippingWithConfig(
           address.latitude ?? 0,
@@ -1069,6 +1309,7 @@ export const placeOrderQR = async (req: Request, res: Response) => {
           discountAmount,
           taxAmount: 0,
           finalAmount,
+          currency: "AED",
           paymentMethod: "QR",
           paymentStatus: "PAID",
           orderStatus: "PROCESSING",
@@ -1106,6 +1347,7 @@ export const placeOrderQR = async (req: Request, res: Response) => {
           paymentMethod: "QR",
           paymentStatus: "PAID",
           amount: finalAmount,
+          currency: "AED",
           transactionId: trimmedTxId,
           paymentScreenshot: screenshotUrl,
           signatureValid: null,
@@ -1132,7 +1374,7 @@ export const placeOrderQR = async (req: Request, res: Response) => {
         });
         const shortId = order.id.slice(-6);
         const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
-        await notifyUsers(req, order.id, `New QR Order from ${user!.username}: ₹${finalAmount}`, "NEW_ORDER", userId, orderRecipients);
+        await notifyUsers(req, order.id, `New QR Order from ${user!.username}: ${formatOrderAmount(finalAmount, "AED")}`, "NEW_ORDER", userId, orderRecipients);
         await notifyUsers(req, order.id, `Your QR payment order #${shortId} has been submitted! Awaiting verification.`, "NEW_ORDER", userId, [userId]);
 
         if (user?.email) {
@@ -1140,7 +1382,7 @@ export const placeOrderQR = async (req: Request, res: Response) => {
             await sendEmail({
               to: user.email,
               toName: user.username,
-              ...orderConfirmationEmailPayload(shortId, user.username, finalAmount.toFixed(2), "ONLINE"),
+              ...orderConfirmationEmailPayload(shortId, user.username, finalAmount.toFixed(2), "ONLINE", "AED"),
             });
             logger.info(`QR order confirmation email sent for ${user.email}`);
           } catch (emailErr) {
@@ -1531,7 +1773,8 @@ export const getOrdersForAdmin = async (req: Request, res: Response) => {
 export const getOrderStats = async (req: Request, res: Response) => {
   try {
     const { status, source, placedBy, invoicePrinted, startDate, endDate } = req.query as Record<string, string | undefined>;
-    const match: Record<string, any> = {};
+    const currencyCondition = "AED";
+    const match: Record<string, any> = { currency: currencyCondition };
 
     if (status) {
       match.orderStatus = status.toUpperCase();
@@ -1602,6 +1845,7 @@ export const getOrderStats = async (req: Request, res: Response) => {
     });
 
     const unprintedMatch: Record<string, any> = {
+      currency: currencyCondition,
       invoicePrinted: { $ne: true },
       orderStatus: { $ne: "CANCELLED" },
     };
@@ -1911,6 +2155,7 @@ export const getMyTransactions = async (req: Request, res: Response) => {
           shippingCharge: true,
           discountAmount: true,
           finalAmount: true,
+          currency: true,
           razorpayPaymentId: true,
           razorpayOrderId: true,
           coupon: { select: { code: true } },
@@ -1982,6 +2227,7 @@ export const getCustomerTransactions = async (req: Request, res: Response) => {
           shippingCharge: true,
           discountAmount: true,
           finalAmount: true,
+          currency: true,
           razorpayPaymentId: true,
           razorpayOrderId: true,
           coupon: { select: { code: true } },
@@ -2218,7 +2464,7 @@ export const searchCustomersForOrder = async (req: Request, res: Response) => {
         { phone:    { $regex: q, $options: "i" } },
       ],
     })
-      .select("id username email phone")
+      .select("id username email phone emailVerifiedAt posActivationRequired")
       .limit(10)
       .lean();
 
@@ -2231,6 +2477,8 @@ export const searchCustomersForOrder = async (req: Request, res: Response) => {
           username: c.username,
           email: c.email ?? null,
           phone: c.phone ?? null,
+          emailVerifiedAt: c.emailVerifiedAt ?? null,
+          posActivationRequired: Boolean(c.posActivationRequired),
           recentAddress,
         };
       })
@@ -2247,28 +2495,39 @@ export const searchCustomersForOrder = async (req: Request, res: Response) => {
 // Check if a customer already exists with the given phone number or email.
 export const checkCustomerExists = async (req: Request, res: Response) => {
   try {
-    const phone = (req.query.phone as string | undefined)?.trim();
-    const email = (req.query.email as string | undefined)?.trim().toLowerCase();
+    const rawPhone = (req.query.phone as string | undefined)?.trim();
+    const normalizedPhone = rawPhone ? normalizeUaeMobile(rawPhone) : null;
+    const rawEmail = (req.query.email as string | undefined)?.trim();
+    const normalizedEmail = rawEmail ? (normalizeEmail(rawEmail) ?? rawEmail.toLowerCase()) : undefined;
 
-    if (!phone && !email) {
+    if (!rawPhone && !normalizedEmail) {
       return res.json({ exists: false, customer: null });
     }
 
+    const phoneCandidates = Array.from(
+      new Set([normalizedPhone, rawPhone].filter((v): v is string => Boolean(v))),
+    );
     const conditions: any[] = [];
-    if (phone) conditions.push({ phone });
-    if (email) conditions.push({ email });
+    if (phoneCandidates.length > 0) conditions.push({ phone: { $in: phoneCandidates } });
+    if (normalizedEmail) {
+      conditions.push({ email: normalizedEmail });
+      conditions.push({ email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } });
+    }
 
     const customer = await User.findOne({
       role: "CUSTOMER",
       $or: conditions,
     })
-      .select("id username email phone")
+      .select("id username email phone emailVerifiedAt posActivationRequired")
       .lean();
 
     if (customer) {
       const customerId = customer._id ? String(customer._id) : String(customer.id);
       const recentAddress = await getCustomerRecentAddress(customerId);
-      const matchType = phone && customer.phone === phone ? "phone" : "email";
+      const matchType =
+        phoneCandidates.length > 0 && customer.phone && phoneCandidates.includes(customer.phone)
+          ? "phone"
+          : "email";
       return res.json({
         exists: true,
         matchType,
@@ -2277,6 +2536,8 @@ export const checkCustomerExists = async (req: Request, res: Response) => {
           username: customer.username,
           email: customer.email ?? null,
           phone: customer.phone ?? null,
+          emailVerifiedAt: (customer as any).emailVerifiedAt ?? null,
+          posActivationRequired: Boolean((customer as any).posActivationRequired),
           recentAddress,
         },
       });
@@ -2294,22 +2555,32 @@ export const checkCustomerExists = async (req: Request, res: Response) => {
 export const checkRecentOrderForCustomer = async (req: Request, res: Response) => {
   try {
     const customerId = (req.query.customerId as string | undefined)?.trim();
-    const phone = (req.query.phone as string | undefined)?.trim();
-    const email = (req.query.email as string | undefined)?.trim().toLowerCase();
+    const rawPhone = (req.query.phone as string | undefined)?.trim();
+    const normalizedPhone = rawPhone ? normalizeUaeMobile(rawPhone) : null;
+    const rawEmail = (req.query.email as string | undefined)?.trim();
+    const normalizedEmail = rawEmail ? (normalizeEmail(rawEmail) ?? rawEmail.toLowerCase()) : undefined;
 
     let targetUserId: string | null = null;
     let customerName: string = "";
 
     if (customerId) {
-      const user = await User.findById(customerId).select("id username").lean();
-      if (user) {
-        targetUserId = String((user as any)._id || (user as any).id);
-        customerName = (user as any).username;
+      if (mongoose.Types.ObjectId.isValid(customerId)) {
+        const user = await User.findById(customerId).select("id username").lean();
+        if (user) {
+          targetUserId = String((user as any)._id || (user as any).id);
+          customerName = (user as any).username;
+        }
       }
-    } else if (phone || email) {
+    } else if (rawPhone || normalizedEmail) {
+      const phoneCandidates = Array.from(
+        new Set([normalizedPhone, rawPhone].filter((v): v is string => Boolean(v))),
+      );
       const conditions: any[] = [];
-      if (phone) conditions.push({ phone });
-      if (email) conditions.push({ email });
+      if (phoneCandidates.length > 0) conditions.push({ phone: { $in: phoneCandidates } });
+      if (normalizedEmail) {
+        conditions.push({ email: normalizedEmail });
+        conditions.push({ email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } });
+      }
 
       const user = await User.findOne({
         role: "CUSTOMER",
@@ -2385,6 +2656,7 @@ export const checkRecentOrderForCustomer = async (req: Request, res: Response) =
         relativeTime,
         finalAmount: recentOrder.finalAmount,
         totalAmount: recentOrder.totalAmount,
+        currency: recentOrder.currency,
         orderStatus: recentOrder.orderStatus,
         paymentMethod: recentOrder.paymentMethod,
         placedByAdmin: !!(recentOrder as any).placedByAdminId,
@@ -2415,7 +2687,7 @@ export const getProductsForAdminOrder = async (req: Request, res: Response) => {
       prisma.product.findMany({
         where,
         select: {
-          id: true, name: true, code: true, image: true, description: true, price: true, stock: true,
+          id: true, name: true, code: true, image: true, description: true, price: true, discount: true, stock: true,
           category: { select: { id: true, name: true } },
         },
         orderBy: { name: "asc" },
@@ -2456,12 +2728,12 @@ export const getProductsForAdminOrder = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/orders/admin-order/place   (admin / super-admin)
+// POST /api/order/admin-order/place   (admin / super-admin / permitted staff)
 // Body: {
 //   customerId?:   string,          // existing CUSTOMER id
-//   newCustomer?:  { username, phone, email? }, // create new if no customerId
-//   items:         [{ productId, quantity }],
-//   address:       { fullAddress, city, state, zipCode, country },
+//   newCustomer?:  { username, phone, email }, // create new if no customerId
+//   items:         [{ productId, variantId?, quantity }],
+//   address?:      { fullAddress, locality?, city, state, zipCode, country },
 //   paymentMethod: "CASH" | "POD",
 //   paymentNote?:  string,           // e.g. UPI ref, receipt no, etc.
 // }
@@ -2478,8 +2750,8 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
       couponId,
       bypassRecentOrderWarning,
     } = req.body as {
-      customerId?: string;
-      newCustomer?: { username: string; phone: string; email?: string };
+      customerId?: string | null;
+      newCustomer?: { username?: unknown; phone?: unknown; email?: unknown };
       items: Array<{ productId: string; variantId?: string | null; quantity: number }>;
       address?: { fullAddress?: string; locality?: string; city?: string; state?: string; zipCode?: string; country?: string };
       paymentMethod: "CASH" | "POD";
@@ -2489,38 +2761,68 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
     };
 
     // ── 1. Resolve customer ──────────────────────────────────────────────────
-    let customer: { id: string; username: string; email: string | null };
+    let customer: {
+      id: string;
+      username: string;
+      email: string | null;
+      emailVerifiedAt?: Date | null;
+      posActivationRequired?: boolean;
+    };
 
     if (customerId) {
+      if (!mongoose.Types.ObjectId.isValid(customerId)) {
+        return res.status(404).json({ message: "Customer not found" });
+      }
       const existing = await prisma.user.findUnique({
         where: { id: customerId },
-        select: { id: true, username: true, email: true, phone: true, role: true },
+        select: {
+          id: true,
+          username: true,
+          email: true,
+          phone: true,
+          role: true,
+          emailVerifiedAt: true,
+          posActivationRequired: true,
+        },
       });
       if (!existing || existing.role !== "CUSTOMER") {
         return res.status(404).json({ message: "Customer not found" });
       }
       customer = existing;
     } else if (newCustomer) {
-      if (!newCustomer.username?.trim() || !newCustomer.phone?.trim()) {
-        return res.status(400).json({ message: "Name and phone are required for a new customer" });
-      }
-      const cleanPhone = newCustomer.phone.trim();
-      const cleanEmail = newCustomer.email?.trim().toLowerCase() || null;
+      const cleanName = typeof newCustomer.username === "string" ? newCustomer.username.trim() : "";
+      const cleanPhone = normalizeUaeMobile(newCustomer.phone);
+      const cleanEmail = normalizeEmail(newCustomer.email);
 
-      // Check if phone or email already exists
-      let existingUser = await prisma.user.findFirst({
-        where: { phone: cleanPhone },
-        select: { id: true, username: true, email: true, phone: true, role: true },
-      });
-
-      if (!existingUser && cleanEmail) {
-        existingUser = await prisma.user.findFirst({
-          where: { email: cleanEmail },
-          select: { id: true, username: true, email: true, phone: true, role: true },
-        });
+      if (!cleanName || cleanName.length < 2 || cleanName.length > 80) {
+        return res.status(400).json({ message: "Customer name (2-80 characters) is required for a new customer" });
       }
+      if (!cleanPhone) {
+        return res.status(400).json({ message: "A valid UAE mobile number is required for a new customer" });
+      }
+      if (!cleanEmail) {
+        return res.status(400).json({ message: "A valid email address is required for a new customer" });
+      }
+
+      // Check across all roles so phone/email remain globally unique and cannot create mixed-role duplicates
+      const existingUser = await User.findOne({
+        $or: [
+          { phone: cleanPhone },
+          { email: cleanEmail },
+          { email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: "i" } },
+        ],
+      })
+        .select("_id username email phone role emailVerifiedAt posActivationRequired")
+        .lean();
 
       if (existingUser) {
+        if (existingUser.role !== "CUSTOMER") {
+          return res.status(409).json({
+            code: "NON_CUSTOMER_CONFLICT",
+            message: "A staff or administrator account is already registered with this phone number or email address.",
+          });
+        }
+        const existingId = existingUser._id ? String(existingUser._id) : String((existingUser as any).id);
         const isPhoneMatch = existingUser.phone === cleanPhone;
         return res.status(409).json({
           code: "CUSTOMER_ALREADY_EXISTS",
@@ -2529,10 +2831,12 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
             : "A customer with this email address already exists.",
           conflictField: isPhoneMatch ? "phone" : "email",
           existingCustomer: {
-            id: existingUser.id,
+            id: existingId,
             username: existingUser.username,
-            phone: existingUser.phone,
-            email: existingUser.email,
+            phone: existingUser.phone ?? null,
+            email: existingUser.email ?? null,
+            emailVerifiedAt: (existingUser as any).emailVerifiedAt ?? null,
+            posActivationRequired: Boolean((existingUser as any).posActivationRequired),
           },
         });
       }
@@ -2541,38 +2845,66 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
       try {
         created = await prisma.user.create({
           data: {
-            username: newCustomer.username.trim(),
+            username: cleanName,
             phone: cleanPhone,
             email: cleanEmail,
             role: "CUSTOMER",
             isVerified: true,
+            isActive: true,
+            tokenVersion: 0,
+            emailVerifiedAt: null,
+            posActivationRequired: true,
           },
-          select: { id: true, username: true, email: true, phone: true },
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            phone: true,
+            emailVerifiedAt: true,
+            posActivationRequired: true,
+          },
         });
       } catch (createErr: any) {
-        if (createErr.code === 11000 || createErr.message?.includes("duplicate")) {
-          const fallbackUser = await prisma.user.findFirst({
-            where: {
-              OR: [
-                { phone: cleanPhone },
-                ...(cleanEmail ? [{ email: cleanEmail }] : []),
-              ],
-            },
-            select: { id: true, username: true, email: true, phone: true },
-          });
+        const dupCode = createErr?.code ?? createErr?.cause?.code;
+        if (dupCode === 11000 || createErr?.message?.includes("duplicate")) {
+          const fallbackUser = await User.findOne({
+            $or: [
+              { phone: cleanPhone },
+              { email: cleanEmail },
+              { email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: "i" } },
+            ],
+          })
+            .select("_id username email phone role emailVerifiedAt posActivationRequired")
+            .lean();
           if (fallbackUser) {
+            if (fallbackUser.role !== "CUSTOMER") {
+              return res.status(409).json({
+                code: "NON_CUSTOMER_CONFLICT",
+                message: "A staff or administrator account is already registered with this phone number or email address.",
+              });
+            }
+            const fallbackId = fallbackUser._id ? String(fallbackUser._id) : String((fallbackUser as any).id);
+            const isPhoneMatch = fallbackUser.phone === cleanPhone || Boolean(createErr?.keyPattern?.phone);
             return res.status(409).json({
               code: "CUSTOMER_ALREADY_EXISTS",
-              message: "A customer with these details already exists.",
-              conflictField: "phone",
+              message: isPhoneMatch
+                ? "A customer with this phone number already exists."
+                : "A customer with this email address already exists.",
+              conflictField: isPhoneMatch ? "phone" : "email",
               existingCustomer: {
-                id: fallbackUser.id,
+                id: fallbackId,
                 username: fallbackUser.username,
-                phone: fallbackUser.phone,
-                email: fallbackUser.email,
+                phone: fallbackUser.phone ?? null,
+                email: fallbackUser.email ?? null,
+                emailVerifiedAt: (fallbackUser as any).emailVerifiedAt ?? null,
+                posActivationRequired: Boolean((fallbackUser as any).posActivationRequired),
               },
             });
           }
+          return res.status(409).json({
+            code: "CUSTOMER_ALREADY_EXISTS",
+            message: "A customer with these details already exists.",
+          });
         }
         throw createErr;
       }
@@ -2639,6 +2971,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
             relativeTime,
             finalAmount: recentOrder.finalAmount,
             totalAmount: recentOrder.totalAmount,
+            currency: recentOrder.currency,
             orderStatus: recentOrder.orderStatus,
             paymentMethod: recentOrder.paymentMethod,
             placedByAdmin: !!(recentOrder as any).placedByAdminId,
@@ -2656,7 +2989,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
     const productIds = items.map((i: any) => i.productId);
     const products = await prisma.product.findMany({
       where: { id: { in: productIds }, isActive: true },
-      select: { id: true, name: true, price: true, stock: true },
+      select: { id: true, name: true, price: true, discount: true, stock: true },
     });
 
     const productMap = Object.fromEntries(products.map((p: any) => [p.id, p]));
@@ -2719,6 +3052,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
           discountAmount,
           taxAmount: 0,
           finalAmount,
+          currency: "AED",
           paymentMethod: paymentMethod as "CASH" | "POD",
           paymentStatus: paymentMethod === "CASH" ? "PAID" : "PENDING",
           orderStatus: "CONFIRMED",
@@ -2749,6 +3083,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
           paymentMethod: paymentMethod as "CASH" | "POD",
           paymentStatus: paymentMethod === "CASH" ? "PAID" : "PENDING",
           amount: finalAmount,
+          currency: "AED",
           gatewayResponse: {
             placedByAdmin: adminId,
             note: paymentNote ?? (paymentMethod === "CASH" ? "Cash collected at counter" : "Pay on delivery"),
@@ -2773,7 +3108,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
         await sendEmail({
           to: customer.email,
           toName: customer.username,
-          ...orderConfirmationEmailPayload(shortId, customer.username, finalAmount.toFixed(2), paymentMethod === "CASH" ? "ONLINE" : "POD"),
+          ...orderConfirmationEmailPayload(shortId, customer.username, finalAmount.toFixed(2), paymentMethod === "CASH" ? "ONLINE" : "POD", "AED"),
         });
         logger.info(`Admin-order confirmation email sent for ${customer.email}`);
       } catch (emailErr) {
@@ -2793,11 +3128,357 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
     res.status(201).json({
       message: "Order placed successfully",
       order: { id: order.id, shortId, finalAmount, paymentMethod, orderStatus: order.orderStatus },
-      customer: { id: customer.id, username: customer.username, email: customer.email },
+      customer: {
+        id: customer.id,
+        username: customer.username,
+        email: customer.email,
+        emailVerifiedAt: customer.emailVerifiedAt ?? null,
+        posActivationRequired: Boolean(customer.posActivationRequired),
+      },
     });
   } catch (err: any) {
     logger.error("placeAdminOrder error", err);
     res.status(500).json({ message: "Failed to place order", error: err.message });
+  }
+};
+
+// POST /api/order/admin-order/pos-verify/request-otp  (admin / super-admin / staff with ORDER_CREATE)
+export const requestPosCustomerEmailOtp = async (req: Request, res: Response) => {
+  try {
+    const { customerId, email: submittedEmail } = req.body as {
+      customerId?: string;
+      email?: string;
+    };
+
+    if (!customerId || !mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ message: "Valid customer ID is required." });
+    }
+
+    const customer = await User.findById(customerId)
+      .select("_id username email role isActive emailVerifiedAt posActivationRequired")
+      .lean();
+
+    if (!customer || customer.role !== "CUSTOMER") {
+      return res.status(404).json({ message: "Customer account not found." });
+    }
+
+    if (customer.isActive === false) {
+      return res.status(403).json({
+        message: "This customer account is deactivated.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    const targetEmail = normalizeEmail(customer.email);
+    if (!targetEmail) {
+      return res.status(400).json({
+        message: "Customer account does not have a valid email address.",
+        code: "EMAIL_MISSING",
+      });
+    }
+
+    if (submittedEmail !== undefined && submittedEmail.trim() !== "") {
+      const normalizedSubmitted = normalizeEmail(submittedEmail);
+      if (!normalizedSubmitted || normalizedSubmitted !== targetEmail) {
+        return res.status(400).json({
+          message: "Submitted email does not match the customer's registered email address.",
+          code: "EMAIL_MISMATCH",
+        });
+      }
+    }
+
+    if (customer.emailVerifiedAt && !customer.posActivationRequired) {
+      return res.status(200).json({
+        alreadyVerified: true,
+        message: "Customer email is already verified.",
+        customer: {
+          id: String(customer._id),
+          username: customer.username,
+          email: targetEmail,
+          emailVerifiedAt: customer.emailVerifiedAt,
+          posActivationRequired: false,
+        },
+      });
+    }
+
+    const issued = await issueChallengeAndEnqueueOutbox({
+      purpose: "pos_counter_verify",
+      email: targetEmail,
+      toName: customer.username,
+      ip: req.ip,
+      userId: customer._id,
+      pendingData: {
+        customerId: String(customer._id),
+        email: targetEmail,
+        initiatedByAdminId: req.user!.id,
+      },
+    });
+
+    if (!issued.ok) {
+      return res.status(issued.httpStatus).json({
+        message: issued.message,
+        code: issued.code,
+        ...(issued.retryAfterSeconds ? { retryAfterSeconds: issued.retryAfterSeconds } : {}),
+      });
+    }
+
+    return res.status(200).json({
+      alreadyVerified: false,
+      message: `Verification OTP sent to ${targetEmail}.`,
+      challengeId: issued.challengeId,
+      email: targetEmail,
+      customerId: String(customer._id),
+      expiresInSeconds: issued.expiresInSeconds,
+      resendAfterSeconds: issued.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("requestPosCustomerEmailOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Failed to initiate customer email verification." });
+  }
+};
+
+// POST /api/order/admin-order/pos-verify/resend-otp  (admin / super-admin / staff with ORDER_CREATE)
+export const resendPosCustomerEmailOtp = async (req: Request, res: Response) => {
+  try {
+    const { customerId, challengeId } = req.body as {
+      customerId?: string;
+      challengeId?: string;
+    };
+
+    if (!customerId || !mongoose.Types.ObjectId.isValid(customerId) || !challengeId) {
+      return res.status(400).json({ message: "Valid customerId and challengeId are required." });
+    }
+
+    const customer = await User.findById(customerId)
+      .select("_id username email role isActive")
+      .lean();
+
+    if (!customer || customer.role !== "CUSTOMER") {
+      return res.status(404).json({ message: "Customer account not found." });
+    }
+
+    if (customer.isActive === false) {
+      return res.status(403).json({
+        message: "This customer account is deactivated.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    const targetEmail = normalizeEmail(customer.email);
+    if (!targetEmail) {
+      return res.status(400).json({
+        message: "Customer account does not have a valid email address.",
+        code: "EMAIL_MISSING",
+      });
+    }
+
+    const resendRes = await resendChallengeAndEnqueueOutbox({
+      purpose: "pos_counter_verify",
+      email: targetEmail,
+      challengeId,
+      userId: customer._id,
+      ip: req.ip,
+      toName: customer.username,
+    });
+
+    if (!resendRes.ok) {
+      return res.status(resendRes.httpStatus).json({
+        message: resendRes.message,
+        code: resendRes.code,
+        ...(resendRes.retryAfterSeconds
+          ? { retryAfterSeconds: resendRes.retryAfterSeconds }
+          : {}),
+      });
+    }
+
+    return res.status(200).json({
+      message: `New verification OTP sent to ${targetEmail}.`,
+      challengeId: resendRes.challengeId,
+      email: targetEmail,
+      customerId: String(customer._id),
+      expiresInSeconds: resendRes.expiresInSeconds,
+      resendAfterSeconds: resendRes.resendAfterSeconds,
+    });
+  } catch (err: unknown) {
+    logger.error("resendPosCustomerEmailOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Failed to resend verification OTP." });
+  }
+};
+
+// POST /api/order/admin-order/pos-verify/verify-otp  (admin / super-admin / staff with ORDER_CREATE)
+export const verifyPosCustomerEmailOtp = async (req: Request, res: Response) => {
+  try {
+    const { customerId, challengeId, otp } = req.body as {
+      customerId?: string;
+      challengeId?: string;
+      otp?: string;
+    };
+
+    if (!customerId || !mongoose.Types.ObjectId.isValid(customerId) || !challengeId || !otp) {
+      return res
+        .status(400)
+        .json({ message: "Customer ID, verification session, and 6-digit OTP are required." });
+    }
+
+    const customer = await User.findById(customerId)
+      .select("_id username email role isActive")
+      .lean();
+
+    if (!customer || customer.role !== "CUSTOMER") {
+      return res.status(404).json({ message: "Customer account not found." });
+    }
+
+    if (customer.isActive === false) {
+      return res.status(403).json({
+        message: "This customer account is deactivated.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    const targetEmail = normalizeEmail(customer.email);
+    if (!targetEmail) {
+      return res.status(400).json({
+        message: "Customer account does not have a valid email address.",
+        code: "EMAIL_MISSING",
+      });
+    }
+
+    await ensureOtpCollectionsInitialized();
+    const session = await mongoose.startSession();
+
+    let verifiedSummary: {
+      id: string;
+      username: string;
+      email: string;
+      emailVerifiedAt: Date;
+      posActivationRequired: boolean;
+    } | null = null;
+    let txFailure: {
+      httpStatus: number;
+      code: string;
+      message: string;
+      attemptsRemaining?: number;
+      retryAfterSeconds?: number;
+    } | null = null;
+
+    try {
+      await session.withTransaction(async () => {
+        verifiedSummary = null;
+        txFailure = null;
+
+        const verifyRes = await verifyChallengeOtp({
+          purpose: "pos_counter_verify",
+          email: targetEmail,
+          otp,
+          challengeId,
+          userId: customer._id,
+          ip: req.ip,
+          session,
+        });
+
+        if (!verifyRes.ok) {
+          txFailure = {
+            httpStatus: verifyRes.httpStatus,
+            code: verifyRes.code,
+            message: verifyRes.message,
+            attemptsRemaining: verifyRes.attemptsRemaining,
+            retryAfterSeconds: verifyRes.retryAfterSeconds,
+          };
+          throw new TxAbortError();
+        }
+
+        const freshCustomer = await User.findById(customer._id).session(session);
+        if (
+          !freshCustomer ||
+          freshCustomer.role !== "CUSTOMER" ||
+          freshCustomer.isActive === false ||
+          normalizeEmail(freshCustomer.email) !== targetEmail
+        ) {
+          txFailure = {
+            httpStatus: 409,
+            code: "CHALLENGE_INVALID",
+            message: "Customer email or account status changed. Please request a new OTP.",
+          };
+          throw new TxAbortError();
+        }
+
+        const verifiedAt = new Date();
+        freshCustomer.emailVerifiedAt = verifiedAt;
+        freshCustomer.posActivationRequired = false;
+        freshCustomer.isVerified = true;
+        await freshCustomer.save({ session });
+
+        verifiedSummary = {
+          id: String(freshCustomer._id),
+          username: freshCustomer.username,
+          email: targetEmail,
+          emailVerifiedAt: verifiedAt,
+          posActivationRequired: false,
+        };
+      });
+    } catch (txErr: unknown) {
+      if (!(txErr instanceof TxAbortError)) {
+        throw txErr;
+      }
+    } finally {
+      await session.endSession();
+    }
+
+    if (txFailure) {
+      const f = txFailure as {
+        httpStatus: number;
+        code: string;
+        message: string;
+        attemptsRemaining?: number;
+        retryAfterSeconds?: number;
+      };
+      return res.status(f.httpStatus).json({
+        message: f.message,
+        code: f.code,
+        ...(typeof f.attemptsRemaining === "number"
+          ? { attemptsRemaining: f.attemptsRemaining }
+          : {}),
+        ...(f.retryAfterSeconds ? { retryAfterSeconds: f.retryAfterSeconds } : {}),
+      });
+    }
+
+    if (!verifiedSummary) {
+      return res.status(500).json({ message: "Failed to verify customer email." });
+    }
+
+    const summary = verifiedSummary as {
+      id: string;
+      username: string;
+      email: string;
+      emailVerifiedAt: Date;
+      posActivationRequired: boolean;
+    };
+
+    await createAuditLog({
+      req,
+      action: "POS_CUSTOMER_EMAIL_VERIFIED",
+      entity: "User",
+      entityId: summary.id,
+      details: {
+        customerId: summary.id,
+        email: summary.email,
+        verifiedByStaffId: req.user!.id,
+      },
+    });
+
+    return res.status(200).json({
+      message: "Customer email verified successfully.",
+      customer: summary,
+    });
+  } catch (err: unknown) {
+    logger.error("verifyPosCustomerEmailOtp error", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return res.status(500).json({ message: "Failed to verify customer email." });
   }
 };
 
@@ -2902,14 +3583,11 @@ export const getShippingToggles = async (_req: Request, res: Response) => {
     res.json({
       calculateShippingForCOD: config.calculateShippingForCOD !== false,
       calculateShippingForOnline: config.calculateShippingForOnline !== false,
-      calculateShippingForQR: config.calculateShippingForQR !== false,
     });
   } catch {
     res.json({
       calculateShippingForCOD: true,
       calculateShippingForOnline: true,
-      calculateShippingForQR: true,
     });
   }
 };
-

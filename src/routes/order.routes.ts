@@ -2,8 +2,8 @@ import { Router } from "express";
 import {
   placeOrder,
   verifyPayment,
+  verifyNomodPayment,
   placeOrderPOD,
-  placeOrderQR,
   cancelOrder,
   preCheckout,
   getOrders,
@@ -19,6 +19,9 @@ import {
   checkRecentOrderForCustomer,
   getProductsForAdminOrder,
   placeAdminOrder,
+  requestPosCustomerEmailOtp,
+  resendPosCustomerEmailOtp,
+  verifyPosCustomerEmailOtp,
   getBulkInvoices,
   markInvoicesPrinted,
   lookupPincode,
@@ -26,11 +29,18 @@ import {
   handleRazorpayWebhook,
 } from "../controllers/order.controller";
 import { authMiddleware } from "../middleware/auth.middleware";
-import { uploadScreenshot } from "../middleware/upload";
 import { adminOrStaff } from "../middleware/staffPermission.middleware";
 import { adminOrSuperAdmin } from "../middleware/admin.middleware";
 import { validate } from "../middleware/validate.middleware";
-import { verifyPaymentSchema, updateOrderStatusSchema } from "../schemas/order.schema";
+import {
+  verifyPaymentSchema,
+  verifyNomodPaymentSchema,
+  updateOrderStatusSchema,
+  placeAdminOrderSchema,
+  posVerifyRequestSchema,
+  posVerifyResendSchema,
+  posVerifyOtpSchema,
+} from "../schemas/order.schema";
 
 const router = Router();
 
@@ -39,9 +49,12 @@ router.post("/razorpay-webhook", handleRazorpayWebhook);
 
 // Customer routes — never gated
 router.post("/place", authMiddleware, placeOrder);
+router.post("/nomod/verify", authMiddleware, validate(verifyNomodPaymentSchema), verifyNomodPayment);
 router.post("/verifyPayment", authMiddleware, validate(verifyPaymentSchema), verifyPayment);
 router.post("/placeOrderPOD", authMiddleware, placeOrderPOD);
-router.post("/placeOrderQR", authMiddleware, uploadScreenshot.single("screenshot"), placeOrderQR);
+router.post("/placeOrderQR", authMiddleware, (_req, res) =>
+  res.status(410).json({ message: "QR payment is not available in the UAE storefront." }),
+);
 router.post("/cancel/:id", authMiddleware, cancelOrder);
 router.post("/pre-checkout", authMiddleware, preCheckout);
 router.get("/myOrders", authMiddleware, getOrders);
@@ -70,7 +83,10 @@ router.get("/admin-order/search-customers", authMiddleware, adminOrStaff("ORDER_
 router.get("/admin-order/check-customer", authMiddleware, adminOrStaff("ORDER_CREATE"), checkCustomerExists);
 router.get("/admin-order/check-recent-order", authMiddleware, adminOrStaff("ORDER_CREATE"), checkRecentOrderForCustomer);
 router.get("/admin-order/products", authMiddleware, adminOrStaff("ORDER_CREATE"), getProductsForAdminOrder);
-router.post("/admin-order/place", authMiddleware, adminOrStaff("ORDER_CREATE"), placeAdminOrder);
+router.post("/admin-order/place", authMiddleware, adminOrStaff("ORDER_CREATE"), validate(placeAdminOrderSchema), placeAdminOrder);
+router.post("/admin-order/pos-verify/request-otp", authMiddleware, adminOrStaff("ORDER_CREATE"), validate(posVerifyRequestSchema), requestPosCustomerEmailOtp);
+router.post("/admin-order/pos-verify/resend-otp", authMiddleware, adminOrStaff("ORDER_CREATE"), validate(posVerifyResendSchema), resendPosCustomerEmailOtp);
+router.post("/admin-order/pos-verify/verify-otp", authMiddleware, adminOrStaff("ORDER_CREATE"), validate(posVerifyOtpSchema), verifyPosCustomerEmailOtp);
 router.get("/admin-order/lookup-pincode/:pincode", authMiddleware, adminOrStaff("ORDER_CREATE"), lookupPincode);
 
 router.get("/:id", authMiddleware, getOrderById); // single order — customer (own) or admin/staff

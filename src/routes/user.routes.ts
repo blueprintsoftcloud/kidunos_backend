@@ -12,6 +12,7 @@ import {
 } from "../controllers/product-user.controller";
 import {
   requestProfileUpdate,
+  resendProfileUpdateOtp,
   verifyAndUpdateProfile,
 } from "../controllers/updateProfile.controller";
 import {
@@ -22,7 +23,12 @@ import {
 } from "../controllers/wishlist.controller";
 import { authMiddleware } from "../middleware/auth.middleware";
 import { validate } from "../middleware/validate.middleware";
-import { reviewSchema } from "../schemas/user.schema";
+import {
+  requestProfileUpdateSchema,
+  resendProfileUpdateSchema,
+  reviewSchema,
+  verifyProfileUpdateSchema,
+} from "../schemas/user.schema";
 
 const router = Router();
 
@@ -37,8 +43,9 @@ router.get("/products/search", searchProducts);
 
 // Authenticated user
 router.get("/profile", authMiddleware, getProfile);
-router.post("/profile/request-update", authMiddleware, requestProfileUpdate);
-router.post("/profile/verify-update", authMiddleware, verifyAndUpdateProfile);
+router.post("/profile/request-update", authMiddleware, validate(requestProfileUpdateSchema), requestProfileUpdate);
+router.post("/profile/resend-otp", authMiddleware, validate(resendProfileUpdateSchema), resendProfileUpdateOtp);
+router.post("/profile/verify-update", authMiddleware, validate(verifyProfileUpdateSchema), verifyAndUpdateProfile);
 router.post("/:id/reviews", authMiddleware, validate(reviewSchema), createProductReview);
 
 // Wishlist
