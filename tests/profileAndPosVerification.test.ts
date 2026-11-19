@@ -373,11 +373,14 @@ describe("PR 2 — Authenticated Profile Email Verification & POS Counter Email 
         .set("Cookie", [`csrfToken=${csrfToken}`])
         .set("X-Forwarded-For", nextTestIp())
         .send({ email: "walkin.counter@storra.test" });
-      expect(customerLoginAttempt.status).toBe(200);
-      const loginChallenge = await OtpChallenge.findOne({
-        challengeId: customerLoginAttempt.body.challengeId,
-      }).lean();
-      expect(loginChallenge?.isDecoy).toBe(true);
+      expect(customerLoginAttempt.status).toBe(403);
+      expect(customerLoginAttempt.body.code).toBe("EMAIL_NOT_VERIFIED");
+      expect(
+        await OtpChallenge.countDocuments({
+          email: "walkin.counter@storra.test",
+          purpose: "customer_login",
+        }),
+      ).toBe(0);
 
       // Knowing the phone number via SMS prep login does NOT stamp emailVerifiedAt or clear posActivationRequired
       const smsLogin = await request(appCtx.app)

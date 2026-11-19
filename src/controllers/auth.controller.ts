@@ -442,7 +442,7 @@ export const customerLoginRequestOtp = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Valid email address is required." });
     }
 
-    const user = await User.findOne({
+    const users = await User.find({
       $or: [
         { email: normalizedEmail },
         { email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } },
@@ -451,20 +451,41 @@ export const customerLoginRequestOtp = async (req: Request, res: Response) => {
       .select("_id username email role isActive emailVerifiedAt posActivationRequired")
       .lean();
 
-    const isEligibleCustomer =
-      Boolean(user) &&
-      user!.role === "CUSTOMER" &&
-      user!.isActive !== false &&
-      Boolean(user!.emailVerifiedAt) &&
-      !user!.posActivationRequired;
+    if (users.length === 0) {
+      return res.status(404).json({
+        message: "No customer account was found for this email. Please create an account.",
+        code: "CUSTOMER_NOT_FOUND",
+      });
+    }
+
+    if (users.some((account) => account.role !== "CUSTOMER")) {
+      return res.status(403).json({
+        message: "This email cannot be used to sign in through the customer login.",
+        code: "ROLE_RESTRICTED",
+      });
+    }
+
+    const user = users[0];
+    if (user.isActive === false) {
+      return res.status(403).json({
+        message: "Your account has been deactivated. Please contact support.",
+        code: "ACCOUNT_DEACTIVATED",
+      });
+    }
+
+    if (!user.emailVerifiedAt || user.posActivationRequired) {
+      return res.status(403).json({
+        message: "Email verification is required before signing in via Email OTP.",
+        code: "EMAIL_NOT_VERIFIED",
+      });
+    }
 
     const issued = await issueChallengeAndEnqueueOutbox({
       purpose: "customer_login",
       email: normalizedEmail,
-      toName: isEligibleCustomer ? user!.username : normalizedEmail,
+      toName: user.username,
       ip: req.ip,
-      isDecoy: !isEligibleCustomer,
-      userId: isEligibleCustomer ? user!._id : null,
+      userId: user._id,
     });
 
     if (!issued.ok) {
@@ -476,8 +497,7 @@ export const customerLoginRequestOtp = async (req: Request, res: Response) => {
     }
 
     return res.status(200).json({
-      message:
-        "If an eligible customer account exists for this email, a 6-digit verification code has been sent.",
+      message: "A 6-digit verification code has been sent to your email.",
       challengeId: issued.challengeId,
       step: "VERIFY_OTP",
       expiresInSeconds: issued.expiresInSeconds,

@@ -511,7 +511,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
     expect(await User.countDocuments({ phone: "9877700099" })).toBe(1);
   });
 
-  it("supports customer Email OTP login for verified customers and consistently decoys/rejects unknown, unverified, POS-pending, inactive, and staff/admin roles", async () => {
+  it("sends customer Email OTP only for eligible customers and directs unknown or restricted accounts appropriately", async () => {
     await enableCustomerEmailOtp();
     const fetchSpy = mockMsg91Success();
 
@@ -568,30 +568,36 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
 
     const { agent, origin, csrfToken } = await bootstrapCsrfAgent(appCtx.app);
 
-    // 1. All ineligible accounts + unknown email receive identical 200 generic decoy without emails
-    const ineligibleEmails = [
-      "unknown.user@storra.test",
-      "sms.unverified@storra.test",
-      "pos.pending@storra.test",
-      "inactive.cust@storra.test",
-      "admin.blocked@storra.test",
-    ];
-    const decoyChallenges: Array<{ email: string; challengeId: string }> = [];
-    for (const email of ineligibleEmails) {
-      const r = await agent
+    // Unknown emails are sent to signup, while existing but ineligible accounts
+    // are not allowed to continue through login.
+    const unknownReq = await agent
+      .post("/api/auth/customer/login/request-otp")
+      .set("Origin", origin)
+      .set("X-CSRF-Token", csrfToken)
+      .set("X-Forwarded-For", nextTestIp())
+      .send({ email: "unknown.user@storra.test" });
+    expect(unknownReq.status).toBe(404);
+    expect(unknownReq.body.code).toBe("CUSTOMER_NOT_FOUND");
+
+    for (const [email, code] of [
+      ["sms.unverified@storra.test", "EMAIL_NOT_VERIFIED"],
+      ["pos.pending@storra.test", "EMAIL_NOT_VERIFIED"],
+      ["inactive.cust@storra.test", "ACCOUNT_DEACTIVATED"],
+      ["admin.blocked@storra.test", "ROLE_RESTRICTED"],
+    ]) {
+      const ineligibleReq = await agent
         .post("/api/auth/customer/login/request-otp")
         .set("Origin", origin)
         .set("X-CSRF-Token", csrfToken)
         .set("X-Forwarded-For", nextTestIp())
         .send({ email });
-      expect(r.status).toBe(200);
-      expect(r.body.step).toBe("VERIFY_OTP");
-      expect(r.body.challengeId).toBeTruthy();
-      expect(r.body.message).toMatch(/If an eligible customer account exists/i);
-      decoyChallenges.push({ email, challengeId: r.body.challengeId });
+      expect(ineligibleReq.status).toBe(403);
+      expect(ineligibleReq.body.code).toBe(code);
     }
 
-    // 2. Eligible verified customer receives identical response format
+    expect(await OtpChallenge.countDocuments({ purpose: "customer_login" })).toBe(0);
+
+    // Eligible verified customer receives the OTP challenge.
     const validReq = await agent
       .post("/api/auth/customer/login/request-otp")
       .set("Origin", origin)
@@ -599,15 +605,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
       .set("X-Forwarded-For", nextTestIp())
       .send({ email: "  VERIFIED.SHOPPER@STORRA.TEST " });
     expect(validReq.status).toBe(200);
-    expect(validReq.body.message).toBe(
-      (await request(appCtx.app)
-        .post("/api/auth/customer/login/request-otp")
-        .set("Origin", origin)
-        .set("Cookie", [`csrfToken=${csrfToken}`])
-        .set("X-CSRF-Token", csrfToken)
-        .set("X-Forwarded-For", nextTestIp())
-        .send({ email: "another.unknown@storra.test" })).body.message,
-    );
+    expect(validReq.body.message).toMatch(/verification code has been sent/i);
 
     // Capture OTP before worker delivery intentionally wipes encryptedPayload
     const realOtp = await readOtpForChallenge(validReq.body.challengeId);
@@ -621,17 +619,6 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
     }).lean();
     expect(deliveredOutbox?.status).toBe("sent");
     expect(deliveredOutbox?.encryptedPayload).toBeUndefined();
-
-    // Decoy verification never succeeds
-    for (const decoy of decoyChallenges) {
-      const decVerify = await agent
-        .post("/api/auth/customer/login/verify-otp")
-        .set("Origin", origin)
-        .set("X-CSRF-Token", csrfToken)
-        .set("X-Forwarded-For", nextTestIp())
-        .send({ ...decoy, otp: "123456" });
-      expect(decVerify.status).toBe(401);
-    }
 
     // 3. Test 5-attempt lockout on verified customer
     const wrongOtp = realOtp === "111111" ? "222222" : "111111";
@@ -826,7 +813,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
       {
         username: "Role Check Admin",
         email: "role.admin@storra.test",
-        phone: "9891000001",
+        phone: "589100001",
         role: "ADMIN",
         isActive: true,
         isVerified: true,
@@ -835,7 +822,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
       {
         username: "Role Check SuperAdmin",
         email: "role.super@storra.test",
-        phone: "9891000002",
+        phone: "589100002",
         role: "SUPER_ADMIN",
         isActive: true,
         isVerified: true,
@@ -844,7 +831,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
       {
         username: "Role Check Staff",
         email: "role.staff@storra.test",
-        phone: "9891000003",
+        phone: "589100003",
         role: "STAFF",
         isActive: true,
         isVerified: true,
@@ -862,24 +849,15 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
     const privilegedAccounts = [admin, superAdmin, staff];
 
     for (const acc of privilegedAccounts) {
-      // Customer Email OTP login emits decoy (zero email sent) & rejects verify
+      // Customer Email OTP login is explicitly restricted for internal roles.
       const loginReq = await agent
         .post("/api/auth/customer/login/request-otp")
         .set("Origin", origin)
         .set("X-CSRF-Token", csrfToken)
         .set("X-Forwarded-For", nextTestIp())
         .send({ email: acc.email });
-      expect(loginReq.status).toBe(200);
-      const chg = await OtpChallenge.findOne({ challengeId: loginReq.body.challengeId }).lean();
-      expect(chg?.isDecoy).toBe(true);
-
-      const loginVer = await agent
-        .post("/api/auth/customer/login/verify-otp")
-        .set("Origin", origin)
-        .set("X-CSRF-Token", csrfToken)
-        .set("X-Forwarded-For", nextTestIp())
-        .send({ email: acc.email, challengeId: loginReq.body.challengeId, otp: "123456" });
-      expect(loginVer.status).toBe(401);
+      expect(loginReq.status).toBe(403);
+      expect(loginReq.body.code).toBe("ROLE_RESTRICTED");
 
       // Customer Email OTP signup with existing privileged email also emits decoy
       const signupReq = await agent
@@ -887,7 +865,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
         .set("Origin", origin)
         .set("X-CSRF-Token", csrfToken)
         .set("X-Forwarded-For", nextTestIp())
-        .send({ name: "Spoof", email: acc.email, phone: "9891999999" });
+        .send({ name: "Spoof", email: acc.email, phone: "589199999" });
       expect(signupReq.status).toBe(200);
       const signupChg = await OtpChallenge.findOne({ challengeId: signupReq.body.challengeId }).lean();
       expect(signupChg?.isDecoy).toBe(true);
@@ -898,7 +876,7 @@ describe("PR 2 — Feature-gated Customer Email OTP Signup & Login", () => {
         .set("Origin", origin)
         .set("X-CSRF-Token", csrfToken)
         .set("X-Forwarded-For", nextTestIp())
-        .send({ phone: acc.phone, accessToken: `91${acc.phone}` });
+        .send({ phone: acc.phone, accessToken: `971${acc.phone}` });
       expect(smsRes.status).toBe(403);
       expect(smsRes.body.code).toBe("ROLE_RESTRICTED");
     }
