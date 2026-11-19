@@ -128,17 +128,74 @@ export const customerSignupRequestOtp = async (req: Request, res: Response) => {
       });
     }
 
-    const existing = await User.findOne({
+    const phoneVariants = [
+      submittedPhone,
+      `0${submittedPhone}`,
+      `971${submittedPhone}`,
+      `+971${submittedPhone}`,
+    ];
+
+    const existingUsers = await User.find({
       $or: [
-        { phone: submittedPhone },
+        { phone: { $in: phoneVariants } },
         { email: normalizedEmail },
         { email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" } },
       ],
     })
-      .select("_id")
+      .select("_id email phone role isActive")
       .lean();
 
-    const isDecoy = Boolean(existing);
+    if (existingUsers.length > 0) {
+      if (existingUsers.some((account) => account.role !== "CUSTOMER")) {
+        return res.status(403).json({
+          message:
+            "This email address or mobile number belongs to an administrative or staff profile. Please log in through the Staff / Admin Portal.",
+          code: "ROLE_RESTRICTED",
+        });
+      }
+
+      const emailMatches = existingUsers.some(
+        (account) =>
+          account.email &&
+          account.email.trim().toLowerCase() === normalizedEmail
+      );
+      const phoneMatches = existingUsers.some(
+        (account) =>
+          account.phone &&
+          (phoneVariants.includes(account.phone.trim()) ||
+            normalizeUaeMobile(account.phone) === submittedPhone)
+      );
+
+      if (emailMatches && phoneMatches) {
+        return res.status(409).json({
+          message:
+            "An account with this email address and mobile number already exists. Please sign in instead.",
+          code: "EMAIL_AND_PHONE_ALREADY_EXISTS",
+        });
+      }
+
+      if (emailMatches) {
+        return res.status(409).json({
+          message:
+            "An account with this email address already exists. Please sign in instead.",
+          code: "EMAIL_ALREADY_EXISTS",
+        });
+      }
+
+      if (phoneMatches) {
+        return res.status(409).json({
+          message:
+            "An account with this mobile number already exists. Please sign in instead.",
+          code: "PHONE_ALREADY_EXISTS",
+        });
+      }
+
+      return res.status(409).json({
+        message:
+          "An account with these details already exists. Please sign in instead.",
+        code: "EMAIL_ALREADY_EXISTS",
+      });
+    }
 
     const issued = await issueChallengeAndEnqueueOutbox({
       purpose: "customer_signup",
@@ -146,7 +203,7 @@ export const customerSignupRequestOtp = async (req: Request, res: Response) => {
       toName: cleanName,
       ip: req.ip,
       phone: submittedPhone,
-      isDecoy,
+      isDecoy: false,
       pendingData: {
         name: cleanName,
         email: normalizedEmail,
@@ -164,7 +221,7 @@ export const customerSignupRequestOtp = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       message:
-        "If these details are eligible for registration, a 6-digit verification code has been sent to your email.",
+        "A 6-digit verification code has been sent to your email.",
       challengeId: issued.challengeId,
       step: "VERIFY_OTP",
       expiresInSeconds: issued.expiresInSeconds,
@@ -214,8 +271,7 @@ export const customerSignupResendOtp = async (req: Request, res: Response) => {
     }
 
     return res.status(200).json({
-      message:
-        "If these details are eligible for registration, a new 6-digit verification code has been sent.",
+      message: "A new 6-digit verification code has been sent to your email.",
       challengeId: resendRes.challengeId,
       step: "VERIFY_OTP",
       expiresInSeconds: resendRes.expiresInSeconds,
@@ -313,23 +369,40 @@ export const customerSignupVerifyOtp = async (req: Request, res: Response) => {
           throw new TxAbortError();
         }
 
+        const pendingPhoneVariants = [
+          pendingPhone,
+          `0${pendingPhone}`,
+          `971${pendingPhone}`,
+          `+971${pendingPhone}`,
+        ];
+
         const existingConflict = await User.findOne({
           $or: [
-            { phone: pendingPhone },
+            { phone: { $in: pendingPhoneVariants } },
             { email: pendingEmail },
             { email: { $regex: `^${escapeRegex(pendingEmail)}$`, $options: "i" } },
           ],
         })
-          .select("_id")
+          .select("_id role email phone")
           .session(session)
           .lean();
 
         if (existingConflict) {
+          if (existingConflict.role !== "CUSTOMER") {
+            failureResponse = {
+              httpStatus: 403,
+              code: "ROLE_RESTRICTED",
+              message:
+                "This email address or mobile number belongs to an administrative or staff profile. Please log in through the Staff / Admin Portal.",
+            };
+            throw new TxAbortError();
+          }
+
           failureResponse = {
             httpStatus: 409,
             code: "SIGNUP_CONFLICT",
             message:
-              "Unable to complete registration with these details. Please sign in or use different details.",
+              "An account with this email or mobile number already exists. Please sign in.",
           };
           throw new TxAbortError();
         }

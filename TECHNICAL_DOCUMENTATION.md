@@ -322,3 +322,78 @@ api.get(`/order/${orderId}`)
 3. **Direct URL Navigation**: Directly navigating to `/invoice/<cancelledOrderId>` as a customer renders the "Invoice Unavailable: Invoices are not available for cancelled orders." state.
 4. **Backend API Direct Call**: Sending `GET /api/orders/<cancelledOrderId>` with a customer Bearer token returns `403 Forbidden`.
 5. **Privileged Roles Unaffected**: Admins and staff can still view and print invoices for cancelled orders as required for accounting and records.
+
+---
+
+# UAE Mobile Number Validation for Admin & Staff
+
+This section documents the update made to support UAE mobile numbers across the administrative user management interfaces and backend validation schemas.
+
+---
+
+## 1. Requirement & Problem Statement
+
+### The Problem:
+* Previously, the **Add New Admin** modal (`AddAdminModal.tsx`), **Add/Edit Staff** modal (`StaffManagement.tsx`), and **Edit User** modal (`Listusers.tsx`) strictly enforced 10-digit Indian mobile formats (`^[6-9][0-9]{9}$` or `^[0-9]{10}$`).
+* The backend Zod schema (`staffCreateSchema` and `staffUpdateSchema` in `backend/src/schemas/staff.schema.ts`) also enforced `/^[6-9][0-9]{9}$/`, causing API rejection for any UAE mobile number.
+* When admins in the UAE tried to enter standard 9-digit UAE mobile numbers (e.g., `527296567` or `0527296567`), the forms rejected the input with `"Enter a valid 10-digit phone number."` or `"Phone must be a valid 10-digit Indian mobile number."`.
+
+### The Solution:
+* Standardize mobile number validation across Admin & Staff workflows to accept UAE mobile numbers (`5xxxxxxxx`, `05xxxxxxxx`, `+9715xxxxxxxx`, `9715xxxxxxxx`) while retaining backward-compatibility for legacy 10-digit Indian numbers.
+* Automatically normalize phone numbers (e.g. `0527296567` or `+971 52 729 6567` $\rightarrow$ canonical `527296567`) before saving to MongoDB / Prisma.
+
+---
+
+## 2. Frontend Changes
+
+1. **`frontend/src/users/AddAdminModal.tsx`**:
+   - Added `isValidMobile` and `normalizeMobile` helper functions.
+   - Updated validation error message: `"Enter a valid UAE mobile number (e.g. 50 123 4567 or 050 123 4567)."`.
+   - Updated input attributes: `placeholder="e.g. 50 123 4567 or 050 123 4567"`, `maxLength={16}`, allowing spaces, hyphens, and `+`.
+   - Normalizes phone numbers in the submission payload.
+
+2. **`frontend/src/dashboard/StaffManagement.tsx`**:
+   - Expanded `isSupportedMobile` to accept UAE numbers with `05` prefix, `+971`, and `971`.
+   - Updated placeholder to `"e.g. 50 123 4567 or 050 123 4567"`, with `maxLength={16}` for both Create and Edit modals.
+   - Normalizes phone numbers prior to dispatching `POST /api/staff` and `PATCH /api/staff/:id`.
+
+3. **`frontend/src/users/Listusers.tsx`**:
+   - Replaced strict Indian regex check with `isSupportedMobile` and `normalizeMobile`.
+   - Updated input placeholder and dynamic validity indicator.
+
+---
+
+## 3. Backend Changes
+
+1. **`backend/src/schemas/staff.schema.ts`**:
+   - Replaced `/^[6-9][0-9]{9}$/` with a Zod transform utilizing `normalizeUaeMobile` and `normalizeIndianMobile`.
+   - Returns clear error: `"Phone must be a valid UAE mobile number (e.g. 50 123 4567 or 050 123 4567) or 10-digit Indian mobile number"`.
+
+2. **`backend/src/controllers/admin.controller.ts`**:
+   - `createAdminUser` & `updateUser` now validate and normalize phone numbers using `normalizeUaeMobile(phone) ?? normalizeIndianMobile(phone)` before checking uniqueness and persisting to the database.
+
+---
+
+## 4. Customer Account Creation Duplicate & Role Restriction Validation
+
+### Background & Issue
+During customer signup (`mode === "register"` in `CustomerAuthModal`), entering an already registered email or phone number previously invoked a silent anti-enumeration "decoy" pattern (`isDecoy = Boolean(existing)`). This returned `200 OK` to the frontend without dispatching an OTP email, trapping the user on the "VERIFY OTP" screen with an "Invalid verification code" error. Furthermore, entering an admin or staff email (such as `kidonusuae@gmail.com`) did not trigger the "Access Restricted" modal screen that existed in the sign-in flow.
+
+### Implementation Details
+
+1. **`backend/src/controllers/auth.controller.ts`**:
+   - **`customerSignupRequestOtp`**:
+     - Pre-checks `existingUsers` matching either the normalized email or submitted UAE phone variants (`submittedPhone`, `0...`, `971...`, `+971...`).
+     - If any matching user has an administrative or staff profile (`role !== "CUSTOMER"`), responds immediately with HTTP 403 `code: "ROLE_RESTRICTED"`.
+     - If the email is already registered, responds with HTTP 409 `code: "EMAIL_ALREADY_EXISTS"` and a prompt to sign in instead.
+     - If the mobile number is already registered, responds with HTTP 409 `code: "PHONE_ALREADY_EXISTS"`.
+     - If both match, responds with HTTP 409 `code: "EMAIL_AND_PHONE_ALREADY_EXISTS"`.
+     - Enqueues genuine OTP verification challenge with `isDecoy: false` so that legitimate new signups reliably receive OTP emails.
+   - **`customerSignupVerifyOtp`**:
+     - Added defense-in-depth check for role restrictions (`ROLE_RESTRICTED`) and phone format variants before creating the user document.
+
+2. **`frontend/src/components/CustomerAuthModal.tsx`**:
+   - Added handling for `EMAIL_ALREADY_EXISTS`, `PHONE_ALREADY_EXISTS`, `EMAIL_AND_PHONE_ALREADY_EXISTS`, and `SIGNUP_CONFLICT`.
+   - Populates inline validation errors (`setEmailError`, `setPhoneError`) and emits toast notifications advising the customer to sign in.
+   - Preserves `ROLE_RESTRICTED` handling which instantly transitions to the "Access Restricted" modal screen with "Try a different email".
+   - Clears `emailError` and `phoneError` dynamically as soon as the user modifies the inputs.

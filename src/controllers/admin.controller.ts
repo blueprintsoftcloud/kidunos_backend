@@ -5,6 +5,7 @@ import logger from "../utils/logger";
 import { createAuditLog } from "../utils/auditLog";
 import { revokeUserSessions } from "../services/session.service";
 import { disconnectUserSockets } from "../socket/socketManager";
+import { normalizeIndianMobile, normalizeUaeMobile } from "../utils/identity";
 
 const calculatePercentage = (current: number, previous: number): number => {
   if (previous === 0) return current === 0 ? 0 : 100;
@@ -460,12 +461,17 @@ export const createAdminUser = async (req: Request, res: Response) => {
     };
     // Normalize once — emails are matched/stored case-insensitively everywhere.
     const email: string = String(req.body.email).trim().toLowerCase();
+    const rawPhone = String(req.body.phone).trim();
+    const normalizedPhone = normalizeUaeMobile(rawPhone) ?? normalizeIndianMobile(rawPhone);
+    if (!normalizedPhone) {
+      return res.status(400).json({ Error: "Phone must be a valid UAE mobile number (e.g. 50 123 4567 or 050 123 4567) or 10-digit Indian mobile number." });
+    }
 
     const emailExisted = await User.findOne({ email });
     if (emailExisted)
       return res.status(400).json({ Error: "An account with this email address already exists." });
 
-    const phoneExisted = await User.findOne({ phone });
+    const phoneExisted = await User.findOne({ phone: normalizedPhone });
     if (phoneExisted)
       return res.status(400).json({ Error: "An account with this phone number already exists." });
 
@@ -482,7 +488,7 @@ export const createAdminUser = async (req: Request, res: Response) => {
     await User.create({
       username,
       email,
-      phone,
+      phone: normalizedPhone,
       password: hashedPassword,
       role: normalizedRole,
       isVerified: true,
@@ -516,6 +522,11 @@ export const updateUser = async (req: Request, res: Response) => {
     const email: string | undefined = req.body.email !== undefined
       ? (req.body.email ? String(req.body.email).trim().toLowerCase() : req.body.email)
       : undefined;
+    const rawPhone = req.body.phone !== undefined ? String(req.body.phone).trim() : undefined;
+    const normalizedPhone = rawPhone ? (normalizeUaeMobile(rawPhone) ?? normalizeIndianMobile(rawPhone)) : undefined;
+    if (rawPhone && !normalizedPhone) {
+      return res.status(400).json({ message: "Phone must be a valid UAE mobile number (e.g. 50 123 4567 or 050 123 4567) or 10-digit Indian mobile number." });
+    }
 
     const existing = await User.findById(id).select("id role email isActive");
     if (!existing) return res.status(404).json({ message: "User not found." });
@@ -524,10 +535,10 @@ export const updateUser = async (req: Request, res: Response) => {
     }
 
     // Check uniqueness conflicts
-    if (email || phone) {
+    if (email || normalizedPhone) {
       const orConditions: any[] = [];
       if (email) orConditions.push({ email });
-      if (phone) orConditions.push({ phone });
+      if (normalizedPhone) orConditions.push({ phone: normalizedPhone });
       const conflict = await User.findOne({
         _id: { $ne: id },
         $or: orConditions,
@@ -548,7 +559,7 @@ export const updateUser = async (req: Request, res: Response) => {
         ...(username !== undefined && { username }),
         ...(email !== undefined && { email }),
         ...(emailChanged && { emailVerifiedAt: null }),
-        ...(phone !== undefined && { phone }),
+        ...(normalizedPhone !== undefined && { phone: normalizedPhone }),
         ...(typeof isActive === "boolean" && { isActive }),
       },
       { new: true },
