@@ -2333,6 +2333,16 @@ export const getOrderById = async (req: Request, res: Response) => {
       return res.status(403).json({ message: "Not authorised" });
     }
 
+    // Customers cannot view invoices for cancelled orders
+    if (
+      requestingUser.role !== Role.ADMIN &&
+      requestingUser.role !== Role.SUPER_ADMIN &&
+      requestingUser.role !== Role.STAFF &&
+      order.orderStatus?.toUpperCase() === "CANCELLED"
+    ) {
+      return res.status(403).json({ message: "Invoices are not available for cancelled orders." });
+    }
+
     res.status(200).json({ order });
   } catch (err: any) {
     logger.error("getOrderById error", err);
